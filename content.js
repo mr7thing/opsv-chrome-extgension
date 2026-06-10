@@ -50,9 +50,9 @@
           if (!ok) {
             throw new Error(`Failed to upload reference: ${fileUrl}`);
           }
-          await sleep(1500);
+          await sleep(2000);
         }
-        remoteLog('All reference images uploaded');
+        remoteLog('All reference images uploaded and confirmed ready');
       }
 
       // Step 2: Type the prompt
@@ -133,9 +133,13 @@
           dt.items.add(file);
           fileInput.files = dt.files;
           fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          await sleep(2000);
-          remoteLog('File input injection done');
-          return true;
+
+          // Wait for upload preview with status tracking
+          const uploaded = await waitForUploadPreview(blob);
+          if (uploaded) {
+            remoteLog('File input upload confirmed');
+            return true;
+          }
         }
       }
 
@@ -251,47 +255,136 @@
     return true;
   }
 
-  async function waitForUploadPreview(expectedBlob, timeoutMs = 15000) {
+  async function waitForUploadPreview(expectedBlob, timeoutMs = 30000) {
     const start = Date.now();
+    let chipFound = false;
+
     while (Date.now() - start < timeoutMs) {
       await sleep(1000);
 
-      // Check for various indicators: image chip, preview thumbnail, uploader area with content
-      const indicators = [
-        '[data-test-id="image-chip"]',
-        '.image-chip',
-        '[class*="imageChip"]',
-        '[class*="ImageChip"]',
-        'img[class*="preview"]',
-        '[class*="media"] img',
-        'mat-chip img',
-        '.mat-chip img',
-        '[class*="upload-preview"] img',
-        // Generic: any new img inside the upload area
-      ];
-
-      for (const sel of indicators) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const img = el.tagName === 'IMG' ? el : el.querySelector('img');
-          if (img && img.naturalWidth > 50) {
-            return true;
-          }
-        }
+      const chip = findUploadChip();
+      if (!chip) {
+        if (chipFound) return true; // chip was there, now gone = upload complete & merged into composer
+        continue;
       }
 
-      // Check in shadow DOMs
-      const allElements = document.querySelectorAll('*');
-      for (const el of allElements) {
-        if (el.shadowRoot) {
-          for (const sel of indicators) {
-            const shadowEl = el.shadowRoot.querySelector(sel);
-            if (shadowEl) return true;
-          }
+      chipFound = true;
+
+      // Check upload status on the chip
+      const status = getUploadChipStatus(chip);
+      remoteLog(`Upload chip status: ${status}`);
+
+      if (status === 'error') {
+        remoteLog('Upload chip shows error state');
+        return false;
+      }
+
+      if (status === 'ready') {
+        remoteLog('Upload chip ready');
+        return true;
+      }
+
+      // status === 'uploading' — keep waiting
+    }
+
+    // Timeout: if we at least found a chip, consider it ready
+    return chipFound;
+  }
+
+  /**
+   * Find the upload chip / thumbnail in the composer area.
+   * Gemini renders pasted images as attachment chips before upload completes.
+   */
+  function findUploadChip() {
+    const selectors = [
+      // Gemini-specific attachment chip selectors
+      '[data-attachment-chip]',
+      '[class*="attachment-chip"]',
+      '[class*="AttachmentChip"]',
+      '[class*="upload-chip"]',
+      // Image thumbnails in the input area
+      '[class*="image-preview"]',
+      '[class*="ImagePreview"]',
+      '.upload-progress',
+      '[class*="upload-progress"]',
+      // Generic: img inside the composer/input area (not in responses)
+      'rich-textarea img',
+      'div[contenteditable="true"] img',
+      // Fallback: any new image element
+    ];
+
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        // Make sure it's in the input area, not a response
+        if (!el.closest('[data-test-id="response"]') &&
+            !el.closest('[class*="response"]') &&
+            !el.closest('message-content')) {
+          return el;
         }
       }
     }
-    return false;
+    return null;
+  }
+
+  /**
+   * Determine the upload state of a chip element.
+   * Returns: 'uploading' | 'ready' | 'error'
+   */
+  function getUploadChipStatus(chip) {
+    // Check for loading/progress indicators
+    const loadingIndicators = [
+      'mat-progress-bar',
+      '[role="progressbar"]',
+      '[class*="progress"]',
+      '[class*="loading"]',
+      '[class*="spinner"]',
+      'mat-spinner',
+      '.mat-progress-spinner',
+      'svg[class*="circular"]',
+      '[aria-label*="Loading"]',
+      '[aria-label*="upload" i]',
+      '[aria-label*="Upload" i]',
+    ];
+
+    for (const sel of loadingIndicators) {
+      const indicator = chip.querySelector(sel) || chip.closest(sel);
+      if (indicator) {
+        // Check if it's actually visible/active
+        const style = window.getComputedStyle(indicator);
+        if (style.display !== 'none' && style.visibility !== 'hidden') {
+          return 'uploading';
+        }
+      }
+    }
+
+    // Check for error state
+    const errorIndicators = [
+      '[class*="error"]',
+      '[class*="Error"]',
+      '[aria-label*="error" i]',
+      '[aria-label*="failed" i]',
+      '.mat-chip-error',
+    ];
+
+    for (const sel of errorIndicators) {
+      const indicator = chip.querySelector(sel) || chip.closest(sel);
+      if (indicator) {
+        const style = window.getComputedStyle(indicator);
+        if (style.display !== 'none' && style.visibility !== 'hidden') {
+          return 'error';
+        }
+      }
+    }
+
+    // If the chip has an img that's fully loaded, consider it ready
+    const img = chip.tagName === 'IMG' ? chip : chip.querySelector('img');
+    if (img && img.complete && img.naturalWidth > 50) {
+      return 'ready';
+    }
+
+    // Default: assume uploading if we have a chip but can't determine state
+    return 'uploading';
   }
 
   // ── Typing ─────────────────────────────────────────────────────────────

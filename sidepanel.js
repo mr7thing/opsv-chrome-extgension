@@ -11,7 +11,6 @@ let isRunning = false;
 let currentJob = null;
 let watermarkEngine = null;
 let queuedJobs = [];     // { id, prompt, reference_files, watermark_removal, status }
-let manualRefFiles = []; // user-dropped files
 let daemonWsUrl = DAEMON_WS_DEFAULT; // resolved dynamically
 
 // ── DOM ────────────────────────────────────────────────────────────────────
@@ -23,7 +22,6 @@ const modeAutoBtn = document.getElementById('mode-auto');
 const modeManualBtn = document.getElementById('mode-manual');
 const modeLabel = document.getElementById('mode-label');
 const removeWatermarkCb = document.getElementById('remove-watermark-cb');
-const refArea = document.getElementById('ref-area');
 
 // ── State persistence ─────────────────────────────────────────────────────
 
@@ -114,6 +112,9 @@ function handleMsg(msg) {
     case 'JOB_COMPLETE':
       // Daemon confirms a job is done — but we already track locally
       break;
+    case 'INCREMENTAL_SAVED':
+      remoteLog(`Incremental result saved for ${msg.shotId}: ${msg.path}`);
+      break;
     default:
       break;
   }
@@ -159,17 +160,63 @@ function renderJobs() {
   for (const job of queuedJobs) {
     const div = document.createElement('div');
     div.className = `job-item ${job.status}`;
+    div.dataset.jobId = job.id;
+
+    // Build reference thumbnails
+    let thumbsHtml = '';
+    if (job.reference_files && job.reference_files.length > 0) {
+      thumbsHtml = '<div class="job-thumbs">';
+      for (const refPath of job.reference_files) {
+      // Path join: DAEMON_HTTP has no trailing slash, refPath starts with /
+      // On Windows convert backslashes to forward slashes for URL safety
+      let safePath = refPath.replace(/\\/g, '/');
+      // Ensure leading / for daemon's /files/ handler to resolve as absolute
+      if (!safePath.startsWith('/')) safePath = '/' + safePath;
+      const fileUrl = `${DAEMON_HTTP}/files/${safePath}`;
+        thumbsHtml += `<img src="${fileUrl}" title="${escapeHtml(refPath.split('/').pop())}" 
+                          onerror="this.style.display='none'" loading="lazy">`;
+      }
+      thumbsHtml += '</div>';
+    }
+
     div.innerHTML = `
       <div class="job-desc">
         <span class="job-id">${escapeHtml(job.id)}</span>
         ${escapeHtml(job.prompt.length > 80 ? job.prompt.substring(0, 80) + '...' : job.prompt)}
-        ${job.reference_files && job.reference_files.length > 0
-          ? `<span class="job-refs">📎 ${job.reference_files.length} refs</span>`
-          : ''}
+        ${thumbsHtml}
       </div>
       <div>
         <span class="job-status ${job.status}">${job.status.toUpperCase()}</span>
       </div>`;
+
+    // ── Per-job drop target for result images ──
+    div.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      div.classList.add('dragover');
+    });
+    div.addEventListener('dragleave', () => {
+      div.classList.remove('dragover');
+    });
+    div.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      div.classList.remove('dragover');
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+
+      for (const f of files) {
+        if (!f.type.startsWith('image/')) continue;
+        const dataUrl = await fileToDataUrl(f);
+        // Send incremental result to daemon
+        sendWs({
+          type: 'INCREMENTAL_RESULT',
+          shotId: job.id,
+          fileName: f.name,
+          dataUrl: dataUrl,
+        });
+        remoteLog(`Result dropped on job ${job.id}: ${f.name}`);
+      }
+    });
+
     jobListEl.appendChild(div);
   }
 
@@ -209,18 +256,26 @@ async function runNextJob() {
       tab = await chrome.tabs.create({ url: 'https://gemini.google.com/app', active: false });
     }
 
-    // Wait briefly for tab to load if just opened
-    await sleep(1500);
-
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: 'EXECUTE_JOB',
-      job: {
-        id: pending.id,
-        prompt: pending.prompt,
-        reference_files: pending.reference_files,
-        watermark_removal: pending.watermark_removal,
-      },
-    });
+    // Wait for tab to load and content script to inject (progressive backoff)
+    const backoffs = [5000, 10000, 15000];
+    let response;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await sleep(backoffs[attempt]);
+      try {
+        response = await chrome.tabs.sendMessage(tab.id, {
+          type: 'EXECUTE_JOB',
+          job: {
+            id: pending.id,
+            prompt: pending.prompt,
+            reference_files: pending.reference_files,
+            watermark_removal: pending.watermark_removal,
+          },
+        });
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+      }
+    }
 
     if (response && response.status === 'started') {
       // Content script will call back via sidepanel message
@@ -323,28 +378,7 @@ async function processWatermarkIfEnabled(blob) {
   }
 }
 
-// ── Reference Image Drag-Drop (manual user upload) ────────────────────────
-
-if (refArea) {
-  refArea.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    refArea.classList.add('dragover');
-  });
-  refArea.addEventListener('dragleave', () => {
-    refArea.classList.remove('dragover');
-  });
-  refArea.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    refArea.classList.remove('dragover');
-    const files = Array.from(e.dataTransfer.files);
-    for (const f of files) {
-      const dataUrl = await fileToDataUrl(f);
-      manualRefFiles.push({ name: f.name, dataUrl, blob: f });
-    }
-    refArea.textContent = `📎 ${manualRefFiles.length} manual ref(s) ready`;
-    remoteLog(`Manual refs: ${manualRefFiles.length} files dropped`);
-  });
-}
+// ── Utils ──────────────────────────────────────────────────────────────────
 
 function fileToDataUrl(file) {
   return new Promise((resolve) => {
@@ -353,8 +387,6 @@ function fileToDataUrl(file) {
     reader.readAsDataURL(file);
   });
 }
-
-// ── Utils ──────────────────────────────────────────────────────────────────
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
