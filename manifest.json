@@ -1,18 +1,20 @@
 {
     "manifest_version": 3,
     "name": "OpenSpec-Video Companion",
-    "version": "0.3.2",
-    "description": "Browser automation companion for OpenSpec-Video",
+    "version": "0.4.0",
+    "description": "Browser automation companion for OpenSpec-Video — Gemini/webapp tasks",
     "permissions": [
         "sidePanel",
         "activeTab",
         "scripting",
-        "storage"
+        "storage",
+        "clipboardRead",
+        "clipboardWrite"
     ],
     "host_permissions": [
         "https://gemini.google.com/*",
-        "ws://localhost:3061/*",
-        "<all_urls>"
+        "ws://127.0.0.1:3061/*",
+        "http://127.0.0.1:9700/*"
     ],
     "background": {
         "service_worker": "background.js"
