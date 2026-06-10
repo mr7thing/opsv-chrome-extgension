@@ -1,126 +1,203 @@
 <!DOCTYPE html>
 <html>
-
 <head>
   <meta charset="utf-8">
   <title>OpsV Companion</title>
   <style>
     body {
-      font-family: sans-serif;
-      padding: 10px;
-      background: #f0f2f5;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 12px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-size: 13px;
     }
-
     .header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 10px;
+      margin-bottom: 12px;
     }
-
+    .header h3 {
+      margin: 0;
+      font-size: 15px;
+      color: #7b8cff;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     .status {
-      width: 10px;
-      height: 10px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      background: #ccc;
+      background: #666;
     }
+    .status.connected { background: #4caf50; }
+    .status.disconnected { background: #f44336; }
 
-    .status.connected {
-      background: #4caf50;
+    .mode-toggle {
+      display: flex;
+      background: #16213e;
+      border-radius: 6px;
+      overflow: hidden;
+      margin-bottom: 12px;
     }
-
-    .status.disconnected {
-      background: #f44336;
+    .mode-btn {
+      flex: 1;
+      padding: 6px 12px;
+      border: none;
+      background: transparent;
+      color: #888;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.2s;
+    }
+    .mode-btn.active {
+      background: #7b8cff;
+      color: #fff;
     }
 
     .job-list {
-      background: white;
+      background: #16213e;
       border-radius: 8px;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
       overflow-y: auto;
-      max-height: 400px;
+      max-height: 420px;
     }
-
     .job-item {
       padding: 10px;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid #1a1a2e;
       display: flex;
       justify-content: space-between;
-      align-items: center;
+      align-items: flex-start;
+      gap: 8px;
     }
-
-    .job-item:last-child {
-      border-bottom: none;
-    }
-
-    .job-item.done {
-      background-color: #e8f5e9;
-    }
+    .job-item:last-child { border-bottom: none; }
+    .job-item.done { background-color: #0d2818; }
+    .job-item.failed { background-color: #2e1111; }
+    .job-item.running { background-color: #1a1a3e; }
 
     .job-desc {
       font-size: 12px;
-      color: #333;
+      color: #ccc;
       flex: 1;
-      margin-right: 10px;
+      word-break: break-word;
     }
-
+    .job-desc .job-id {
+      font-weight: 700;
+      color: #7b8cff;
+      display: block;
+      margin-bottom: 2px;
+    }
+    .job-desc .job-refs {
+      font-size: 10px;
+      color: #888;
+      display: block;
+      margin-top: 2px;
+    }
     .job-status {
       font-size: 10px;
       font-weight: bold;
-      padding: 2px 6px;
+      padding: 2px 8px;
       border-radius: 4px;
-      background: #eee;
+      white-space: nowrap;
+      background: #333;
     }
+    .job-status.pending { background: #555; }
+    .job-status.running { background: #2196f3; color: #fff; }
+    .job-status.done { background: #4caf50; color: #fff; }
+    .job-status.failed { background: #f44336; color: #fff; }
 
-    .btn {
+    .btn-primary {
       width: 100%;
       padding: 8px;
-      background: #2196f3;
+      background: #7b8cff;
       color: white;
       border: none;
-      border-radius: 4px;
+      border-radius: 6px;
       cursor: pointer;
+      font-weight: 600;
+      font-size: 12px;
       margin-top: 10px;
     }
-
-    .btn:disabled {
-      background: #ccc;
+    .btn-primary:disabled {
+      background: #444;
+      cursor: not-allowed;
     }
-
     .btn-action {
-      width: auto;
+      background: transparent;
+      border: 1px solid #555;
+      color: #ccc;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
       font-size: 10px;
-      padding: 4px 8px;
     }
+    .btn-action:hover { border-color: #7b8cff; }
+
+    .controls {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .chk-label {
+      font-size: 11px;
+      color: #999;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .empty-state {
+      padding: 30px 10px;
+      text-align: center;
+      color: #666;
+      font-size: 12px;
+    }
+
+    .ref-upload-area {
+      border: 1px dashed #444;
+      border-radius: 6px;
+      padding: 8px;
+      text-align: center;
+      margin-top: 10px;
+      font-size: 11px;
+      color: #777;
+    }
+    .ref-upload-area.dragover { border-color: #7b8cff; color: #7b8cff; }
   </style>
 </head>
-
 <body>
   <div class="header">
-    <h3>OpsV 0.3.2 Queue</h3>
-    <div id="status-indicator" class="status disconnected" title="Disconnected"></div>
+    <h3>OpsV Queue</h3>
+    <div class="status-row">
+      <span id="mode-label" style="font-size:10px;color:#888;">AUTO</span>
+      <div id="status-indicator" class="status disconnected" title="Disconnected"></div>
+    </div>
+  </div>
+
+  <div class="mode-toggle">
+    <button id="mode-auto" class="mode-btn active">Auto</button>
+    <button id="mode-manual" class="mode-btn">Manual</button>
+  </div>
+
+  <div class="controls">
+    <label class="chk-label">
+      <input type="checkbox" id="remove-watermark-cb" checked> Remove watermark
+    </label>
   </div>
 
   <div id="job-list" class="job-list">
-    <div style="padding:10px; text-align:center; color:#999;">Waiting for OpsV Server...</div>
+    <div class="empty-state">Waiting for OPSV Daemon...</div>
   </div>
 
-  <div style="display: flex; gap: 10px; margin-top: 10px;">
-    <button id="run-all-btn" class="btn" style="background: #e91e63; margin-top: 0;">Run All Jobs</button>
-    <button id="stop-btn" class="btn" style="background: #607d8b; margin-top: 0; display: none;">Stop Sequence</button>
-  </div>
+  <button id="run-all-btn" class="btn-primary" disabled>▶ Run All (0)</button>
 
-  <button id="refresh-btn" class="btn">Refresh Queue</button>
-
-  <div
-    style="display: flex; gap: 8px; margin-top: 12px; align-items: center; justify-content: center; background: white; padding: 8px; border-radius: 4px; border: 1px solid #ddd;">
-    <input type="checkbox" id="remove-watermark-cb" checked style="cursor: pointer; width: 16px; height: 16px;">
-    <label for="remove-watermark-cb" style="font-size: 13px; color: #333; cursor: pointer; font-weight: bold;">🛡️
-      无水印下载</label>
+  <div id="ref-area" class="ref-upload-area">
+    ↓ Drop reference images here for next job
   </div>
 
   <script src="watermark-engine.js"></script>
   <script src="sidepanel.js"></script>
 </body>
-
 </html>
