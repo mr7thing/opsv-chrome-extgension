@@ -1,7 +1,7 @@
 // OPSV Sidepanel — Daemon-bridged job queue with Auto/Manual scheduling
 // ============================================================================
 
-const DAEMON_WS = 'ws://127.0.0.1:3061';
+const DAEMON_WS_DEFAULT = 'ws://127.0.0.1:3061';
 const DAEMON_HTTP = 'http://127.0.0.1:9700';
 
 let ws = null;
@@ -12,6 +12,7 @@ let currentJob = null;
 let watermarkEngine = null;
 let queuedJobs = [];     // { id, prompt, reference_files, watermark_removal, status }
 let manualRefFiles = []; // user-dropped files
+let daemonWsUrl = DAEMON_WS_DEFAULT; // resolved dynamically
 
 // ── DOM ────────────────────────────────────────────────────────────────────
 
@@ -35,15 +36,37 @@ if (removeWatermarkCb) {
   });
 }
 
+// ── Port discovery ──────────────────────────────────────────────────────
+
+async function discoverWsPort() {
+  try {
+    const resp = await fetch(`${DAEMON_HTTP}/health`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.wsPort && data.wsPort > 0) {
+        daemonWsUrl = `ws://127.0.0.1:${data.wsPort}`;
+        remoteLog(`sidepanel: discovered WS port ${data.wsPort}`);
+        return;
+      }
+    }
+  } catch (e) {
+    // HTTP server not up yet, will retry
+  }
+  daemonWsUrl = DAEMON_WS_DEFAULT;
+}
+
 // ── WebSocket ────────────────────────────────────────────────────────────
 
-function connectWs() {
+async function connectWs() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   if (ws) {
     try { ws.close(); } catch {}
   }
 
-  ws = new WebSocket(DAEMON_WS);
+  // Discover actual WS port before connecting
+  await discoverWsPort();
+
+  ws = new WebSocket(daemonWsUrl);
 
   ws.onopen = () => {
     statusEl.className = 'status connected';
