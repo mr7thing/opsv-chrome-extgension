@@ -7,6 +7,24 @@
   }
   window.hasOpsVContentScript = true;
 
+  // Track the last selection range in the composer contenteditable
+  let lastSelectionRange = null;
+
+  document.addEventListener('selectionchange', () => {
+    try {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        const composer = findComposer();
+        if (composer && composer.contains(range.commonAncestorContainer)) {
+          lastSelectionRange = range.cloneRange();
+        }
+      }
+    } catch (err) {
+      // Ignore selection tracking errors
+    }
+  });
+
   // Auto-open companion sidepanel to establish WS connection
   try {
     chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL' }).catch(() => {});
@@ -38,7 +56,7 @@
       checkForResult().then(result => sendResponse(result));
       return true; // async response
     } else if (request.type === 'INJECT_PROMPT') {
-      typePrompt(request.prompt).then(() => sendResponse({ status: 'done' }));
+      typePrompt(request.prompt, true).then(() => sendResponse({ status: 'done' }));
       return true;
     } else if (request.type === 'INJECT_REF_IMAGE') {
       uploadReferenceImage(request.fileUrl).then(() => sendResponse({ status: 'done' }));
@@ -61,7 +79,7 @@
           await sleep(1500);
         }
       }
-      await typePrompt(prompt);
+      await typePrompt(prompt, true);
       remoteLog('Manual injection completed successfully');
     } catch (err) {
       remoteLog('Manual injection error:', err.message);
@@ -89,7 +107,10 @@
       }
 
       // Step 2: Type the prompt
-      await typePrompt(prompt);
+      await typePrompt(prompt, false);
+
+      // 模拟人类点击发送按钮前的短暂犹豫
+      await sleep(1000 + Math.random() * 1000);
 
       // 关键时序优化：在点击发送前一瞬间，立即收集页面上所有已有的图片 URL (包括已上传的参考图)
       const excludeUrls = getExistingImageUrls();
@@ -452,10 +473,42 @@
 
   // ── Typing ─────────────────────────────────────────────────────────────
   // ── Typing ─────────────────────────────────────────────────────────────
-  async function typePrompt(text) {
+  async function typePrompt(text, isManual = false) {
     const composer = findComposer();
     if (!composer) throw new Error('Could not find Gemini composer');
 
+    // 如果是手动模式注入，我们在记忆的或当前的光标位置直接插入
+    if (isManual) {
+      remoteLog('Manual injection: Attempting to insert prompt at cursor position.');
+      if (lastSelectionRange) {
+        try {
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(lastSelectionRange);
+        } catch (e) {
+          remoteLog('Failed to restore last selection range:', e.message);
+        }
+      }
+      
+      // 让输入框重新获得焦点，使选区生效
+      composer.focus();
+      
+      document.execCommand('insertText', false, text);
+      composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+      
+      // 更新记忆的光标位置
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) {
+          lastSelectionRange = sel.getRangeAt(0).cloneRange();
+        }
+      } catch (e) {}
+      
+      await sleep(150);
+      return;
+    }
+
+    // ── 自动模式：清空并模拟人类打字 ───────────────────────────────────────
     focusComposer(composer);
     await sleep(300);
 
@@ -470,15 +523,43 @@
       }
 
       focusComposer(composer);
-      await sleep(100);
+      // 打字前的短暂起势停顿
+      await sleep(500 + Math.random() * 500);
 
-      remoteLog(`Inserting prompt text: "${text}"`);
-      const success = document.execCommand('insertText', false, text);
+      remoteLog(`Starting human-like typing simulation for prompt (${text.length} chars)...`);
+      
+      // 逐字符键入并添加延迟和抖动以模拟真人输入
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        document.execCommand('insertText', false, char);
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        
+        let delay = 15 + Math.random() * 20; // 降低默认打字速度以更加拟真
+        if (char === '.' || char === ',' || char === '!' || char === '?' || char === '\n' || char === '。' || char === '，' || char === '！' || char === '？') {
+          // 标点符号或换行时额外停顿（模拟人类停顿思考）
+          delay += 200 + Math.random() * 200;
+        } else if (Math.random() < 0.05) {
+          // 5% 概率产生打字迟疑
+          delay += 100 + Math.random() * 150;
+        }
+        await sleep(delay);
+      }
+
+      // 模拟人类打完字后在结尾处按一下空格（如果 prompt 结尾不是空格）
+      if (!text.endsWith(' ')) {
+        await sleep(300 + Math.random() * 300);
+        document.execCommand('insertText', false, ' ');
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        composer.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', bubbles: true }));
+        composer.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', code: 'Space', bubbles: true }));
+      }
+
+      composer.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
       await sleep(200);
 
       const newText = (composer.textContent || '').trim();
-      if (!success || !newText.includes(text.trim())) {
-        remoteLog('execCommand insertText failed. Using fallback textNode modification...');
+      if (!newText.includes(text.trim())) {
+        remoteLog('Character typing validation failed. Using fallback textNode modification...');
         const textNode = getLatestTextNode(composer);
         if (textNode) {
           textNode.nodeValue = text;
@@ -488,8 +569,6 @@
         composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
         composer.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
         await sleep(300);
-      } else {
-        composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
       }
     } else {
       remoteLog('Prompt text already present in composer');
@@ -726,6 +805,35 @@
       hasNewImage: false,
     };
   }
+
+  // ── Intercept Drag & Drop from Sidepanel ───────────────────────────────
+  document.addEventListener('dragover', (e) => {
+    try {
+      const types = e.dataTransfer.types;
+      const isUrl = types.includes('text/uri-list') || types.includes('text/plain');
+      if (isUrl) {
+        e.preventDefault();
+      }
+    } catch {}
+  }, true);
+
+  document.addEventListener('drop', async (e) => {
+    try {
+      const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+      if (url && url.startsWith('http://127.0.0.1:9700/files/')) {
+        e.preventDefault();
+        e.stopPropagation();
+        remoteLog(`Detected local reference image drop: ${url}`);
+        const parts = url.split('/files/');
+        if (parts.length > 1) {
+          const fileUrl = decodeURIComponent(parts[1]);
+          await uploadReferenceImage(fileUrl);
+        }
+      }
+    } catch (err) {
+      remoteLog('Error handling drag-drop intercept:', err.message);
+    }
+  }, true);
 
   remoteLog('content.js loaded and ready');
 })();
