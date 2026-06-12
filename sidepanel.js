@@ -123,6 +123,14 @@ function handleMsg(msg) {
         renderJobs(); // refresh UI (F4)
       }
       break;
+    case 'FINAL_ASSET_SAVED':
+      remoteLog(`Final asset saved for ${msg.shotId}: ${msg.path}`);
+      const finalJob = queuedJobs.find(j => j.id === msg.shotId);
+      if (finalJob) {
+        finalJob.result_files = [msg.path];
+        renderJobs();
+      }
+      break;
     default:
       break;
   }
@@ -185,8 +193,9 @@ function renderJobs() {
         let safePath = refPath.replace(/\\/g, '/');
         if (!safePath.startsWith('/')) safePath = '/' + safePath;
         const fileUrl = `${DAEMON_HTTP}/files/${safePath}`;
-        thumbsHtml += `<img src="${fileUrl}" title="${escapeHtml(refPath.split('/').pop())}" 
-                          onerror="this.style.display='none'" loading="lazy">`;
+        thumbsHtml += `<img src="${fileUrl}" class="selected" title="${escapeHtml(refPath.split('/').pop())}" 
+                          data-path="${escapeHtml(refPath)}"
+                          loading="lazy">`;
       }
       thumbsHtml += '</div>';
     }
@@ -196,6 +205,16 @@ function renderJobs() {
     if (job.result_files && job.result_files.length > 0) {
       resultThumbsHtml = '<div class="job-thumbs result-thumbs">';
       for (const resPath of job.result_files) {
+        if (resPath.startsWith('blob:')) {
+          // 渲染为脉冲动画的保存占位图，防止 CSP 报错且美观
+          resultThumbsHtml += `
+            <div class="saving-thumb" title="正在从网页获取图片并落盘保存中...">
+              <div class="pulse-dot"></div>
+              <span class="saving-text">保存中</span>
+            </div>`;
+          continue;
+        }
+
         let fileUrl = resPath;
         if (!resPath.startsWith('http://') && !resPath.startsWith('https://')) {
           let safePath = resPath.replace(/\\/g, '/');
@@ -203,7 +222,7 @@ function renderJobs() {
           fileUrl = `${DAEMON_HTTP}/files/${safePath}`;
         }
         resultThumbsHtml += `<img src="${fileUrl}" title="${escapeHtml(resPath.split('/').pop())}" 
-                            onerror="this.style.display='none'" loading="lazy">`;
+                            loading="lazy">`;
       }
       resultThumbsHtml += '</div>';
     }
@@ -235,16 +254,38 @@ function renderJobs() {
     const promptTextEl = div.querySelector('.job-prompt-text');
     if (promptTextEl) {
       promptTextEl.addEventListener('click', () => {
+        // 点击文本自动切换成手动模式注入
+        switchToManualMode();
         injectPromptText(job);
       });
     }
 
-    // 2. Click individual reference image thumbnail to inject it
+    // 2. Click individual reference image thumbnail to toggle selection + Drag event
     const refThumbImgs = div.querySelectorAll('.thumb-section:first-child .job-thumbs img');
-    refThumbImgs.forEach((imgEl, idx) => {
-      imgEl.addEventListener('click', () => {
-        const refPath = job.reference_files[idx];
-        if (refPath) injectReferenceImage(job, refPath);
+    refThumbImgs.forEach((imgEl) => {
+      // 启用拖拽支持，并绑定 dragstart 事件
+      imgEl.setAttribute('draggable', 'true');
+      imgEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        imgEl.classList.toggle('selected');
+      });
+      imgEl.addEventListener('dragstart', (e) => {
+        const fileUrl = imgEl.src;
+        e.dataTransfer.setData('text/uri-list', fileUrl);
+        e.dataTransfer.setData('text/plain', fileUrl);
+        remoteLog(`Drag start for reference image: ${fileUrl}`);
+      });
+      // 程序化绑定 onerror 处理器，避开 MV3 插件环境对 inline 脚本的 CSP 限制
+      imgEl.addEventListener('error', () => {
+        imgEl.style.display = 'none';
+      });
+    });
+
+    // 另外程序化绑定结果图片的 onerror 处理
+    const resultImgs = div.querySelectorAll('.result-thumbs img');
+    resultImgs.forEach((imgEl) => {
+      imgEl.addEventListener('error', () => {
+        imgEl.style.display = 'none';
       });
     });
 
@@ -253,7 +294,10 @@ function renderJobs() {
     if (injectBtn) {
       injectBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        injectJobAssets(job);
+        switchToManualMode(); // 注入时同样切为手动修改状态
+        const selectedImgs = div.querySelectorAll('.thumb-section:first-child .job-thumbs img.selected');
+        const selectedRefs = Array.from(selectedImgs).map(img => img.dataset.path);
+        injectJobAssets(job, selectedRefs);
       });
     }
 
@@ -392,7 +436,7 @@ async function runJobExecutor(job) {
     isRunning = false;
     currentJob = null;
     if (isAutoMode) {
-      setTimeout(runNextJob, 1000);
+      setTimeout(runNextJob, 3000 + Math.random() * 3000);
     }
   }
 }
@@ -453,7 +497,7 @@ function onJobComplete(shotId, result) {
 
   // Auto-advance if in auto mode
   if (isAutoMode) {
-    setTimeout(runNextJob, 1000);
+    setTimeout(runNextJob, 3000 + Math.random() * 3000);
   }
 }
 
@@ -529,6 +573,13 @@ function sleep(ms) {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 
+function switchToManualMode() {
+  isAutoMode = false;
+  modeManualBtn.classList.add('active');
+  modeAutoBtn.classList.remove('active');
+  modeLabel.textContent = 'MANUAL';
+}
+
 modeAutoBtn.addEventListener('click', () => {
   isAutoMode = true;
   modeAutoBtn.classList.add('active');
@@ -538,10 +589,7 @@ modeAutoBtn.addEventListener('click', () => {
 });
 
 modeManualBtn.addEventListener('click', () => {
-  isAutoMode = false;
-  modeManualBtn.classList.add('active');
-  modeAutoBtn.classList.remove('active');
-  modeLabel.textContent = 'MANUAL';
+  switchToManualMode();
 });
 
 // ── Manual Injections ──────────────────────────────────────────────────────────
@@ -593,17 +641,18 @@ async function injectReferenceImage(job, fileUrl) {
   }
 }
 
-async function injectJobAssets(job) {
+async function injectJobAssets(job, selectedRefs) {
   try {
+    const refs = selectedRefs !== undefined ? selectedRefs : job.reference_files;
     const tabId = await getOrOpenGeminiTab();
     await chrome.tabs.sendMessage(tabId, {
       type: 'INJECT_ALL',
       prompt: job.prompt,
-      reference_files: job.reference_files
+      reference_files: refs
     });
-    remoteLog(`Injected all assets manually for ${job.id}`);
+    remoteLog(`Injected assets manually for ${job.id} (images: ${refs.length})`);
   } catch (err) {
-    remoteLog(`Manual inject all failed: ${err.message}`);
+    remoteLog(`Manual inject assets failed: ${err.message}`);
   }
 }
 

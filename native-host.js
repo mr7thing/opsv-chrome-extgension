@@ -168,6 +168,12 @@ function handleWsMessage(ws, data) {
             status: 'completed',
             imageUrl: localHttpUrl
           });
+
+          broadcast({
+            type: 'FINAL_ASSET_SAVED',
+            shotId: shotId,
+            path: localHttpUrl
+          });
         } catch (err) {
           console.error('Error saving generated asset Base64:', err);
           sendToIpcClient(shotId, {
