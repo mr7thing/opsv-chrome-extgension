@@ -4,6 +4,32 @@
   <meta charset="utf-8">
   <title>OpsV Companion</title>
   <style>
+    /* Prompt Hover Effect */
+    .job-prompt-text {
+      cursor: pointer;
+      padding: 3px 6px;
+      margin: 4px 0;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      transition: all 0.2s;
+    }
+    .job-prompt-text:hover {
+      background: rgba(123, 140, 255, 0.25);
+      border-color: rgba(123, 140, 255, 0.5);
+      color: #fff;
+    }
+    /* Reference Thumbnail Hover Effect */
+    .job-thumbs img {
+      cursor: pointer;
+      transition: transform 0.15s, border-color 0.15s;
+    }
+    .job-thumbs img:hover {
+      transform: scale(1.08);
+      border-color: #7b8cff;
+      box-shadow: 0 0 6px rgba(123, 140, 255, 0.4);
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       padding: 12px;
@@ -168,6 +194,46 @@
       text-align: center;
       color: #666;
       font-size: 12px;
+    }
+    .job-thumbs-container {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .thumb-section {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .thumb-label {
+      font-size: 10px;
+      color: #888;
+      width: 45px;
+      font-weight: bold;
+    }
+    .job-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .btn-action-sm {
+      background: #2b2b3e;
+      border: 1px solid #444;
+      color: #ccc;
+      padding: 3px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 9px;
+      font-weight: bold;
+      transition: all 0.1s;
+      white-space: nowrap;
+    }
+    .btn-action-sm:hover {
+      border-color: #7b8cff;
+      background: #3a3a5e;
+      color: #fff;
     }
   </style>
 </head>

@@ -7,6 +7,11 @@
   }
   window.hasOpsVContentScript = true;
 
+  // Auto-open companion sidepanel to establish WS connection
+  try {
+    chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL' }).catch(() => {});
+  } catch {}
+
   // ── Remote Logger ──────────────────────────────────────────────────────
   function remoteLog(...args) {
     console.log('[OpsV]', ...args);
@@ -32,8 +37,36 @@
     } else if (request.type === 'CHECK_RESPONSE') {
       checkForResult().then(result => sendResponse(result));
       return true; // async response
+    } else if (request.type === 'INJECT_PROMPT') {
+      typePrompt(request.prompt).then(() => sendResponse({ status: 'done' }));
+      return true;
+    } else if (request.type === 'INJECT_REF_IMAGE') {
+      uploadReferenceImage(request.fileUrl).then(() => sendResponse({ status: 'done' }));
+      return true;
+    } else if (request.type === 'INJECT_ALL') {
+      runManualInjectAll(request.prompt, request.reference_files).then(() => sendResponse({ status: 'done' }));
+      return true;
     }
   });
+
+  async function runManualInjectAll(prompt, refFiles) {
+    try {
+      if (refFiles && refFiles.length > 0) {
+        remoteLog(`Manually uploading ${refFiles.length} reference image(s)...`);
+        for (const fileUrl of refFiles) {
+          const ok = await uploadReferenceImage(fileUrl);
+          if (!ok) {
+            remoteLog(`Manual upload failed for image: ${fileUrl}`);
+          }
+          await sleep(1500);
+        }
+      }
+      await typePrompt(prompt);
+      remoteLog('Manual injection completed successfully');
+    } catch (err) {
+      remoteLog('Manual injection error:', err.message);
+    }
+  }
 
   // ── Main Job Runner ────────────────────────────────────────────────────
   async function runJob(job) {
@@ -58,17 +91,28 @@
       // Step 2: Type the prompt
       await typePrompt(prompt);
 
+      // 关键时序优化：在点击发送前一瞬间，立即收集页面上所有已有的图片 URL (包括已上传的参考图)
+      const excludeUrls = getExistingImageUrls();
+
       // Step 3: Click send
       await clickSend();
 
       // Step 4: Wait for generation
-      const result = await waitForGeneration();
+      const result = await waitForGeneration(excludeUrls);
       if (result) {
-        remoteLog(`Generated image: ${result.url}`);
+        remoteLog(`Generated image url: ${result.url}`);
+        
+        // 转换 blob: 为 Base64 传递给后台
+        const base64Data = await getBase64FromUrl(result.url);
+        if (!base64Data) {
+          throw new Error('Failed to extract generated image data to base64');
+        }
+        
         chrome.runtime.sendMessage({
           type: 'ASSET_SAVED',
           shotId,
           paths: [result.url],
+          base64Data: base64Data
         });
       } else {
         throw new Error('No image generated within timeout');
@@ -83,12 +127,31 @@
     }
   }
 
+  async function getBase64FromUrl(url) {
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    } catch (err) {
+      remoteLog('Error converting URL to Base64:', err.message);
+      return null;
+    }
+  }
+
   // ── Reference Image Upload via Clipboard ───────────────────────────────
   async function uploadReferenceImage(fileUrl) {
     try {
       // Step 1: Fetch the image from daemon
-      remoteLog(`Fetching reference: ${fileUrl}`);
-      const blob = await fetchImage(fileUrl);
+      let safePath = fileUrl.replace(/\\/g, '/');
+      if (!safePath.startsWith('/')) safePath = '/' + safePath;
+      const httpUrl = DAEMON_FILES + safePath;
+      remoteLog(`Fetching reference: ${httpUrl}`);
+      const blob = await fetchImage(httpUrl);
       if (!blob) {
         remoteLog('Failed to fetch image');
         return false;
@@ -388,6 +451,7 @@
   }
 
   // ── Typing ─────────────────────────────────────────────────────────────
+  // ── Typing ─────────────────────────────────────────────────────────────
   async function typePrompt(text) {
     const composer = findComposer();
     if (!composer) throw new Error('Could not find Gemini composer');
@@ -395,21 +459,65 @@
     focusComposer(composer);
     await sleep(300);
 
-    // Clear existing content
-    composer.innerHTML = '';
+    const currentText = (composer.textContent || '').trim();
+    remoteLog(`Current composer text content: "${currentText}"`);
 
-    // Bulk insert first, then simulate typing for the textarea to register
-    composer.textContent = text;
-    composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
-    await sleep(200);
+    if (currentText !== text.trim()) {
+      if (currentText.length > 0) {
+        remoteLog('Composer has existing text. Clearing text nodes only...');
+        clearTextNodesOnly(composer);
+        await sleep(200);
+      }
 
-    // Trigger a final space + backspace to ensure Gemini registers the input
-    composer.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
-    await sleep(100);
-    composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+      focusComposer(composer);
+      await sleep(100);
+
+      remoteLog(`Inserting prompt text: "${text}"`);
+      const success = document.execCommand('insertText', false, text);
+      await sleep(200);
+
+      const newText = (composer.textContent || '').trim();
+      if (!success || !newText.includes(text.trim())) {
+        remoteLog('execCommand insertText failed. Using fallback textNode modification...');
+        const textNode = getLatestTextNode(composer);
+        if (textNode) {
+          textNode.nodeValue = text;
+        } else {
+          composer.textContent = text;
+        }
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        composer.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        await sleep(300);
+      } else {
+        composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+      }
+    } else {
+      remoteLog('Prompt text already present in composer');
+    }
 
     await sleep(500);
-    remoteLog('Prompt typed');
+    remoteLog('Prompt typing finished');
+  }
+
+  function getLatestTextNode(container) {
+    let targetNode = null;
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
+    while (walker.nextNode()) {
+      targetNode = walker.currentNode;
+    }
+    return targetNode;
+  }
+
+  function clearTextNodesOnly(container) {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      textNodes.push(node);
+    }
+    for (const tn of textNodes) {
+      tn.nodeValue = '';
+    }
   }
 
   function findComposer() {
@@ -432,10 +540,22 @@
 
   function focusComposer(composer) {
     composer.focus();
-    // Range at end
+    let targetNode = getLatestTextNode(composer);
+
+    if (!targetNode) {
+      let p = composer.querySelector('p');
+      if (!p) {
+        p = document.createElement('p');
+        composer.appendChild(p);
+      }
+      targetNode = document.createTextNode('');
+      p.appendChild(targetNode);
+    }
+
     const range = document.createRange();
-    range.selectNodeContents(composer);
-    range.collapse(false);
+    range.selectNode(targetNode);
+    range.collapse(false); // end of text node
+
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
@@ -507,26 +627,29 @@
   }
 
   // ── Generation Monitoring ──────────────────────────────────────────────
-  async function waitForGeneration() {
+  async function waitForGeneration(passedExcludeUrls = null) {
     const start = Date.now();
     remoteLog('Waiting for image generation...');
 
-    // Watch DOM for new images
-    let lastImageCount = countGeneratedImages();
+    // 若未传入已有的排查集合，则退回实时收集
+    const excludeUrls = passedExcludeUrls || getExistingImageUrls();
+    remoteLog(`Using ${excludeUrls.size} excluded image(s) for generation detection`);
 
     while (Date.now() - start < GENERATION_TIMEOUT_MS) {
       await sleep(IMAGE_CHECK_INTERVAL_MS);
-      const currentCount = countGeneratedImages();
 
-      if (currentCount > lastImageCount) {
-        // New image appeared — wait a bit for it to fully load
-        await sleep(3000);
-        const result = extractLatestImage();
-        if (result) return result;
-        lastImageCount = currentCount;
+      try {
+        // 提取符合生成大图条件的最新图片
+        const result = extractLatestImage(excludeUrls);
+        if (result) {
+          remoteLog(`Successfully detected new generated image: ${result.url}`);
+          return result;
+        }
+      } catch (err) {
+        remoteLog(`Error in extractLatestImage: ${err.message}`);
       }
 
-      // Also check response text for error indicators
+      // 同时也检查页面上是否有生成失败的错误文字
       const errorText = document.querySelector('[class*="error"]');
       if (errorText && errorText.textContent.includes('unable to generate')) {
         throw new Error('Gemini reported unable to generate');
@@ -536,24 +659,44 @@
     return null;
   }
 
-  function countGeneratedImages() {
-    // Count images in response area (not in input/composer)
-    const responses = document.querySelectorAll('[data-test-id="response"], [class*="response-container"] img');
-    return responses.length;
+  function getExistingImageUrls() {
+    const urls = new Set();
+    const imgs = document.querySelectorAll('img');
+    for (const img of imgs) {
+      if (img.src && (img.src.startsWith('http') || img.src.startsWith('blob:'))) {
+        urls.add(img.src);
+      }
+    }
+    return urls;
   }
 
-  function extractLatestImage() {
+  function extractLatestImage(excludeUrls = new Set()) {
     const imgs = Array.from(document.querySelectorAll('img'));
-    // Find the largest, most complete image that's not tiny (likely generated)
     let best = null;
     let bestScore = 0;
 
     for (const img of imgs) {
-      if (!img.src || !img.src.startsWith('http')) continue;
-      if (!img.complete || img.naturalWidth < 200) continue;
+      if (!img.src) continue;
+      const src = img.src;
 
-      // Score by size and position
-      const score = img.naturalWidth * img.naturalHeight;
+      if (!src.startsWith('http') && !src.startsWith('blob:')) continue;
+      if (excludeUrls.has(src)) continue;
+
+      const isComplete = img.complete;
+      const width = img.naturalWidth;
+      const height = img.naturalHeight;
+      const isImageBtn = img.closest('.image-button') || (img.classList && img.classList.contains('image-button'));
+
+      remoteLog(`Detected new image: src=${src.slice(0, 60)}... complete=${isComplete} size=${width}x${height} isImageBtn=${!!isImageBtn}`);
+
+      const lowerSrc = src.toLowerCase();
+      if (lowerSrc.includes('avatar') || lowerSrc.includes('profile') || lowerSrc.includes('logo') || lowerSrc.includes('icon')) {
+        continue;
+      }
+
+      if (width < 100 && !isImageBtn) continue;
+
+      const score = (width || 200) * (height || 200);
       if (score > bestScore) {
         bestScore = score;
         best = img;
@@ -561,10 +704,11 @@
     }
 
     if (best) {
+      remoteLog(`Selected best generated image: src=${best.src.slice(0, 60)}... size=${best.naturalWidth}x${best.naturalHeight}`);
       return {
         url: best.src,
-        width: best.naturalWidth,
-        height: best.naturalHeight,
+        width: best.naturalWidth || 512,
+        height: best.naturalHeight || 512,
       };
     }
     return null;
