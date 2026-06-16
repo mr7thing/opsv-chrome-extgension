@@ -68,9 +68,16 @@ const httpServer = http.createServer((req, res) => {
   if (reqUrl === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', wsPort: 3061 }));
-  } else if (reqUrl.startsWith('/files/')) {
-    const rawPath = reqUrl.substring('/files/'.length);
-    let filePath = decodeURIComponent(rawPath);
+  } else if (reqUrl.startsWith('/files')) {
+    // Support both /files/<path> and /files?path=<encodedPath>
+    const parsedUrl = new URL(reqUrl, 'http://127.0.0.1:9700');
+    let filePath;
+    if (parsedUrl.searchParams.has('path')) {
+      filePath = parsedUrl.searchParams.get('path');
+    } else {
+      const rawPath = reqUrl.substring('/files/'.length);
+      filePath = decodeURIComponent(rawPath);
+    }
     
     // Normalize Windows path: strip leading slash if drive letter
     if (filePath.startsWith('/') && filePath.length > 2 && filePath[2] === ':') {
@@ -160,8 +167,8 @@ function handleWsMessage(ws, data) {
           console.log(`Saved generated asset locally to: ${savePath}`);
 
           let safePath = savePath.replace(/\\/g, '/');
-          if (!safePath.startsWith('/')) safePath = '/' + safePath;
-          const localHttpUrl = `http://127.0.0.1:9700/files${safePath}`;
+          // Use query param to avoid double-slash normalization issues
+          const localHttpUrl = `http://127.0.0.1:9700/files?path=${encodeURIComponent(safePath)}`;
           
           sendToIpcClient(shotId, {
             type: 'task_result',
