@@ -18,6 +18,7 @@ let daemonWsUrl = DAEMON_WS_DEFAULT; // resolved dynamically
 const statusEl = document.getElementById('status-indicator');
 const jobListEl = document.getElementById('job-list');
 const runAllBtn = document.getElementById('run-all-btn');
+const stopBtn = document.getElementById('stop-btn');
 const modeAutoBtn = document.getElementById('mode-auto');
 const modeManualBtn = document.getElementById('mode-manual');
 const modeLabel = document.getElementById('mode-label');
@@ -31,6 +32,53 @@ if (removeWatermarkCb) {
   });
   removeWatermarkCb.addEventListener('change', (e) => {
     chrome.storage.local.set({ removeWatermark: e.target.checked });
+  });
+}
+
+// ── Queue state persistence ────────────────────────────────────────────────
+
+function saveState() {
+  const state = {
+    queuedJobs: queuedJobs.map(j => ({
+      id: j.id,
+      prompt: j.prompt,
+      reference_files: j.reference_files,
+      watermark_removal: j.watermark_removal,
+      status: j.status,
+      result_files: j.result_files || []
+    })),
+    isAutoMode,
+    isRunning,
+    currentJobId: currentJob ? currentJob.id : null,
+    timestamp: Date.now()
+  };
+  chrome.storage.local.set({ queueState: state });
+}
+
+function restoreState() {
+  chrome.storage.local.get(['queueState'], (result) => {
+    if (result.queueState) {
+      const state = result.queueState;
+      if (Date.now() - state.timestamp < 24 * 60 * 60 * 1000) {
+        queuedJobs = state.queuedJobs || [];
+        isAutoMode = state.isAutoMode !== undefined ? state.isAutoMode : true;
+        if (state.isRunning && state.currentJobId) {
+          currentJob = queuedJobs.find(j => j.id === state.currentJobId) || null;
+          isRunning = false; // Don't resume auto-run, but preserve queue
+        }
+        // Restore auto/manual mode button states
+        if (isAutoMode) {
+          modeAutoBtn.classList.add('active');
+          modeManualBtn.classList.remove('active');
+          modeLabel.textContent = 'AUTO';
+        } else {
+          modeManualBtn.classList.add('active');
+          modeAutoBtn.classList.remove('active');
+          modeLabel.textContent = 'MANUAL';
+        }
+        renderJobs();
+      }
+    }
   });
 }
 
@@ -69,12 +117,26 @@ async function connectWs() {
   ws.onopen = () => {
     statusEl.className = 'status connected';
     statusEl.title = 'Connected';
+    if (chrome.action) {
+      chrome.action.setBadgeText({ text: 'ON' });
+      chrome.action.setBadgeBackgroundColor({ color: '#4caf50' });
+    }
     remoteLog('sidepanel: WS connected');
+
+    // Recovery: check if there's a job running and try to recover
+    if (currentJob && !isRunning) {
+      // No job actively running, but check if there's a pending queue
+      checkRecovery();
+    }
   };
 
   ws.onclose = () => {
     statusEl.className = 'status disconnected';
     statusEl.title = 'Disconnected';
+    if (chrome.action) {
+      chrome.action.setBadgeText({ text: 'OFF' });
+      chrome.action.setBadgeBackgroundColor({ color: '#f44336' });
+    }
     remoteLog('sidepanel: WS disconnected, reconnecting in 3s...');
     scheduleReconnect();
   };
@@ -156,6 +218,7 @@ function addJob(job) {
   }
 
   renderJobs();
+  saveState();
 
   if (isAutoMode && !isRunning) {
     runNextJob();
@@ -166,6 +229,7 @@ function updateJobStatus(jobId, status) {
   const job = queuedJobs.find(j => j.id === jobId);
   if (job) job.status = status;
   renderJobs();
+  saveState();
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
@@ -377,6 +441,9 @@ async function runJobExecutor(job) {
   currentJob = job;
   updateJobStatus(job.id, 'running');
 
+  stopBtn.style.display = 'block';
+  runAllBtn.style.display = 'none';
+
   sendWs({ type: 'JOB_STARTED', shotId: job.id });
 
   try {
@@ -432,6 +499,8 @@ async function runJobExecutor(job) {
   } catch (err) {
     remoteLog(`runJobExecutor error: ${err.message}`);
     updateJobStatus(job.id, 'failed');
+    stopBtn.style.display = 'none';
+    runAllBtn.style.display = 'block';
     sendWs({ type: 'JOB_FAILED', shotId: job.id, error: err.message });
     isRunning = false;
     currentJob = null;
@@ -446,6 +515,14 @@ async function runNextJob() {
   const pending = queuedJobs.find(j => j.status === 'pending');
   if (!pending) {
     isRunning = false;
+    // All jobs complete — show DONE badge
+    const allDone = queuedJobs.every(j => j.status === 'done' || j.status === 'failed');
+    if (allDone && queuedJobs.length > 0 && chrome.action) {
+      chrome.action.setBadgeText({ text: 'DONE' });
+      chrome.action.setBadgeBackgroundColor({ color: '#4caf50' });
+    }
+    stopBtn.style.display = 'none';
+    runAllBtn.style.display = 'block';
     return;
   }
   await runJobExecutor(pending);
@@ -454,7 +531,7 @@ async function runNextJob() {
 function runAllJobs() {
   if (isRunning) return;
   
-  // Reset failed jobs to pending (F2)
+  // Reset failed jobs to pending
   for (const job of queuedJobs) {
     if (job.status === 'failed') {
       job.status = 'pending';
@@ -466,6 +543,7 @@ function runAllJobs() {
   modeManualBtn.classList.remove('active');
   modeLabel.textContent = 'AUTO';
   renderJobs();
+  saveState();
   runNextJob();
 }
 
@@ -484,9 +562,7 @@ function onJobComplete(shotId, result) {
       paths: result.paths || [],
       base64Data: result.base64Data
     });
-
-    // Save result to storage for the daemon to pick up
-    chrome.storage.local.set({ [`result_${shotId}`]: result });
+    saveState();
   } else {
     updateJobStatus(shotId, 'failed');
     sendWs({ type: 'JOB_FAILED', shotId, error: result.error || 'Unknown error' });
@@ -494,14 +570,17 @@ function onJobComplete(shotId, result) {
 
   currentJob = null;
   isRunning = false;
+  stopBtn.style.display = 'none';
+  runAllBtn.style.display = 'block';
 
   // Auto-advance if in auto mode
   if (isAutoMode) {
     setTimeout(runNextJob, 3000 + Math.random() * 3000);
   }
+  saveState();
 }
 
-// ── Chrome runtime messages (from content script) ────────────────────────
+// ── Chrome runtime messages (from content script)
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'ASSET_SAVED') {
@@ -658,7 +737,77 @@ async function injectJobAssets(job, selectedRefs) {
 
 runAllBtn.addEventListener('click', runAllJobs);
 
-// Start
+// ── Recovery ───────────────────────────────────────────────────────────────
+
+async function checkRecovery() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
+    if (tabs.length === 0) {
+      remoteLog('Recovery: No Gemini tab found');
+      return;
+    }
+    const tab = tabs[0];
+    // Try to inject content script and check for results
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content.js']
+      });
+    } catch {}
+    await sleep(1000);
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'CHECK_LAST_IMAGE' });
+    if (response && response.hasNewImage && response.base64Data) {
+      remoteLog('Recovery: Found existing generated image on Gemini page');
+      // Find the last running/pending job
+      const pendingJob = queuedJobs.find(j => j.status === 'running' || j.status === 'pending');
+      if (pendingJob) {
+        pendingJob.status = 'done';
+        pendingJob.result_files = [response.imageUrl || ''];
+        renderJobs();
+        saveState();
+        // Notify daemon
+        sendWs({
+          type: 'ASSET_SAVED',
+          shotId: pendingJob.id,
+          paths: [response.imageUrl || ''],
+          base64Data: response.base64Data
+        });
+        remoteLog(`Recovery: Saved recovered image for ${pendingJob.id}`);
+      }
+    }
+  } catch (err) {
+    remoteLog('Recovery check error:', err.message);
+  }
+}
+
+// ── Stop Button ────────────────────────────────────────────────────────────
+
+function stopRunAll() {
+  isAutoMode = false;
+  isRunning = false;
+  currentJob = null;
+  modeManualBtn.classList.add('active');
+  modeAutoBtn.classList.remove('active');
+  modeLabel.textContent = 'MANUAL';
+  stopBtn.style.display = 'none';
+  runAllBtn.style.display = 'block';
+  renderJobs();
+  saveState();
+  if (chrome.action) {
+    chrome.action.setBadgeText({ text: 'OFF' });
+    chrome.action.setBadgeBackgroundColor({ color: '#f44336' });
+  }
+  remoteLog('Queue execution stopped by user');
+}
+
+stopBtn.addEventListener('click', stopRunAll);
+
+// ── Init ───────────────────────────────────────────────────────────────────
+
+// Restore persisted queue state
+restoreState();
+
+// Start connection
 connectWs();
 renderJobs();
 remoteLog('sidepanel initialized');

@@ -55,6 +55,10 @@
     } else if (request.type === 'CHECK_RESPONSE') {
       checkForResult().then(result => sendResponse(result));
       return true; // async response
+    } else if (request.type === 'CHECK_LAST_IMAGE') {
+      // Recovery: scan page for latest generated image
+      checkForResult().then(result => sendResponse(result));
+      return true;
     } else if (request.type === 'INJECT_PROMPT') {
       typePrompt(request.prompt, true).then(() => sendResponse({ status: 'done' }));
       return true;
@@ -123,8 +127,24 @@
       if (result) {
         remoteLog(`Generated image url: ${result.url}`);
         
-        // 转换 blob: 为 Base64 传递给后台
-        const base64Data = await getBase64FromUrl(result.url);
+        // Try to find a high-res download link (Gemini native download button)
+        let bestUrl = result.url;
+        if (result.element) {
+          const highResUrl = findHighResDownloadUrl(result.element);
+          if (highResUrl && !highResUrl.startsWith('javascript:')) {
+            remoteLog('Found high-res download link:', highResUrl.substring(0, 60));
+            bestUrl = highResUrl;
+          } else if (bestUrl.includes('googleusercontent.com')) {
+            const expanded = bestUrl.replace(/=(w|h|s|c)[0-9a-zA-Z\-_]+.*/, '=s4096-rj');
+            if (expanded !== bestUrl) {
+              remoteLog('Expanded googleusercontent URL for high-res:', expanded.substring(0, 60));
+              bestUrl = expanded;
+            }
+          }
+        }
+        
+        // 转换最佳质量的图片为 Base64
+        const base64Data = await getBase64FromUrl(bestUrl);
         if (!base64Data) {
           throw new Error('Failed to extract generated image data to base64');
         }
@@ -788,6 +808,7 @@
         url: best.src,
         width: best.naturalWidth || 512,
         height: best.naturalHeight || 512,
+        element: best,
       };
     }
     return null;
@@ -798,12 +819,76 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // ── Result Check (for sidepanel polling) ───────────────────────────────
+  // ── Result Check (for sidepanel polling & recovery) ────────────────────
   async function checkForResult() {
-    return {
-      imageCount: countGeneratedImages(),
-      hasNewImage: false,
-    };
+    remoteLog('Running detailed result check...');
+    const imgs = Array.from(document.querySelectorAll('img'));
+    remoteLog(`Found ${imgs.length} images on page.`);
+
+    // Iterate backwards (latest images first)
+    for (let i = imgs.length - 1; i >= 0; i--) {
+      const img = imgs[i];
+      if (!img.src || !img.src.startsWith('http')) continue;
+
+      const info = `[${i}] Src: ${img.src.substring(0, 30)}... Complete: ${img.complete} NatW: ${img.naturalWidth}`;
+      
+      if (img.complete && img.naturalWidth > 200) {
+        remoteLog('Found preview image:', info);
+
+        // Try to find a high-res download link nearby
+        const highResUrl = findHighResDownloadUrl(img);
+        if (highResUrl) {
+          remoteLog('Found native high-res download link:', highResUrl.substring(0, 60));
+          const base64Data = await getBase64FromUrl(highResUrl);
+          if (base64Data) {
+            return { hasNewImage: true, imageUrl: highResUrl, base64Data };
+          }
+        }
+
+        // Heuristic fallback: expand googleusercontent URL
+        let finalUrl = img.src;
+        if (finalUrl.includes('googleusercontent.com')) {
+          finalUrl = finalUrl.replace(/=(w|h|s|c)[0-9a-zA-Z\-_]+.*/, '=s4096-rj');
+          remoteLog('Heuristic expansion:', finalUrl.substring(0, 60));
+          const base64Data = await getBase64FromUrl(finalUrl);
+          if (base64Data) {
+            return { hasNewImage: true, imageUrl: finalUrl, base64Data };
+          }
+        }
+
+        // Fallback: use the image src directly
+        const base64Data = await getBase64FromUrl(img.src);
+        if (base64Data) {
+          return { hasNewImage: true, imageUrl: img.src, base64Data };
+        }
+        return { hasNewImage: true, imageUrl: img.src };
+      }
+    }
+
+    remoteLog('No completed result found in recent images.');
+    return { hasNewImage: false, imageCount: imgs.length };
+  }
+
+  /**
+   * Search 8 levels up from an image element for a high-res download link.
+   * Gemini often nests download buttons inside the image container.
+   */
+  function findHighResDownloadUrl(img) {
+    let container = img.parentElement;
+    for (let k = 0; k < 8; k++) {
+      if (!container) break;
+      const anchors = Array.from(container.querySelectorAll('a[href]'));
+      const realLink = anchors.find(a => {
+        const label = (a.getAttribute('aria-label') || '').toLowerCase();
+        const tooltip = (a.getAttribute('data-tooltip') || '').toLowerCase();
+        return a.hasAttribute('download') ||
+               label.includes('download') || label.includes('下载') ||
+               tooltip.includes('download') || tooltip.includes('下载');
+      });
+      if (realLink) return realLink.href;
+      container = container.parentElement;
+    }
+    return null;
   }
 
   // ── Intercept Drag & Drop from Sidepanel ───────────────────────────────
