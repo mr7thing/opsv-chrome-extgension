@@ -353,5 +353,27 @@ function handleIpcCommand(socket, cmd) {
         watermark_removal: cmd.watermarkRemoval !== false
       }
     });
+  } else if (ctype === 'sync') {
+    const jobs = cmd.jobs || [];
+    console.log(`[IPC Server]: Received sync with ${jobs.length} task(s)`);
+
+    // ACK immediately
+    socket.write(JSON.stringify({
+      type: 'ack',
+      status: 'synced',
+      count: jobs.length
+    }) + '\n');
+    socket.end();
+
+    // Forward full batch to side panel (replaces old queue)
+    broadcast({
+      type: 'SYNC_QUEUE',
+      jobs: jobs.map(j => ({
+        id: j.shotId,
+        prompt: j.prompt || '',
+        reference_files: j.referenceFiles || [],
+        watermark_removal: j.watermarkRemoval !== false
+      }))
+    });
   }
 }

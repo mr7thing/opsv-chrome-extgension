@@ -35,54 +35,7 @@ if (removeWatermarkCb) {
   });
 }
 
-// ── Queue state persistence ────────────────────────────────────────────────
-
-function saveState() {
-  const state = {
-    queuedJobs: queuedJobs.map(j => ({
-      id: j.id,
-      prompt: j.prompt,
-      reference_files: j.reference_files,
-      watermark_removal: j.watermark_removal,
-      status: j.status,
-      result_files: j.result_files || []
-    })),
-    isAutoMode,
-    isRunning,
-    currentJobId: currentJob ? currentJob.id : null,
-    timestamp: Date.now()
-  };
-  chrome.storage.local.set({ queueState: state });
-}
-
-function restoreState() {
-  chrome.storage.local.get(['queueState'], (result) => {
-    if (result.queueState) {
-      const state = result.queueState;
-      if (Date.now() - state.timestamp < 24 * 60 * 60 * 1000) {
-        queuedJobs = state.queuedJobs || [];
-        isAutoMode = state.isAutoMode !== undefined ? state.isAutoMode : true;
-        if (state.isRunning && state.currentJobId) {
-          currentJob = queuedJobs.find(j => j.id === state.currentJobId) || null;
-          isRunning = false; // Don't resume auto-run, but preserve queue
-        }
-        // Restore auto/manual mode button states
-        if (isAutoMode) {
-          modeAutoBtn.classList.add('active');
-          modeManualBtn.classList.remove('active');
-          modeLabel.textContent = 'AUTO';
-        } else {
-          modeManualBtn.classList.add('active');
-          modeAutoBtn.classList.remove('active');
-          modeLabel.textContent = 'MANUAL';
-        }
-        renderJobs();
-      }
-    }
-  });
-}
-
-// ── Port discovery ──────────────────────────────────────────────────────
+// ── Job execution ──────────────────────────────────────────────────────────
 
 async function discoverWsPort() {
   try {
@@ -171,6 +124,19 @@ function handleMsg(msg) {
     case 'NEW_JOB':
       addJob(msg.job);
       break;
+    case 'SYNC_QUEUE':
+      // opsv CLI sent a fresh batch — replace entire queue
+      queuedJobs = (msg.jobs || []).map(j => ({
+        id: j.id,
+        prompt: j.prompt || '',
+        reference_files: j.reference_files || [],
+        watermark_removal: j.watermark_removal !== false,
+        status: 'pending',
+        result_files: []
+      }));
+      renderJobs();
+      if (isAutoMode && !isRunning) runNextJob();
+      break;
     case 'JOB_COMPLETE':
       // Daemon confirms a job is done — but we already track locally
       break;
@@ -218,7 +184,7 @@ function addJob(job) {
   }
 
   renderJobs();
-  saveState();
+
 
   if (isAutoMode && !isRunning) {
     runNextJob();
@@ -229,7 +195,6 @@ function updateJobStatus(jobId, status) {
   const job = queuedJobs.find(j => j.id === jobId);
   if (job) job.status = status;
   renderJobs();
-  saveState();
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
@@ -546,7 +511,7 @@ function runAllJobs() {
   modeManualBtn.classList.remove('active');
   modeLabel.textContent = 'AUTO';
   renderJobs();
-  saveState();
+
   runNextJob();
 }
 
@@ -565,7 +530,7 @@ function onJobComplete(shotId, result) {
       paths: result.paths || [],
       base64Data: result.base64Data
     });
-    saveState();
+  
   } else {
     updateJobStatus(shotId, 'failed');
     sendWs({ type: 'JOB_FAILED', shotId, error: result.error || 'Unknown error' });
@@ -580,7 +545,7 @@ function onJobComplete(shotId, result) {
   if (isAutoMode) {
     setTimeout(runNextJob, 3000 + Math.random() * 3000);
   }
-  saveState();
+
 }
 
 // ── Chrome runtime messages (from content script)
@@ -767,7 +732,7 @@ async function checkRecovery() {
         pendingJob.status = 'done';
         pendingJob.result_files = [response.imageUrl || ''];
         renderJobs();
-        saveState();
+      
         // Notify daemon
         sendWs({
           type: 'ASSET_SAVED',
@@ -795,7 +760,7 @@ function stopRunAll() {
   stopBtn.style.display = 'none';
   runAllBtn.style.display = 'block';
   renderJobs();
-  saveState();
+
   if (chrome.action) {
     chrome.action.setBadgeText({ text: 'OFF' });
     chrome.action.setBadgeBackgroundColor({ color: '#f44336' });
@@ -806,9 +771,6 @@ function stopRunAll() {
 stopBtn.addEventListener('click', stopRunAll);
 
 // ── Init ───────────────────────────────────────────────────────────────────
-
-// Restore persisted queue state
-restoreState();
 
 // Start connection
 connectWs();

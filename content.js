@@ -224,7 +224,7 @@
       if (composer2) {
         focusComposer(composer2);
         await sleep(500);
-        await pasteIntoComposer(composer2, blob);
+        await pasteIntoComposer(composer2);
         await waitForUploadPreview(blob);
         remoteLog('Clipboard upload preview confirmed');
         return true;
@@ -346,7 +346,7 @@
         if (composerCb) {
           focusComposer(composerCb);
           await sleep(500);
-          await pasteIntoComposer(composerCb, blobs[i]);
+          await pasteIntoComposer(composerCb);
           await waitForUploadPreview(blobs[i]);
           remoteLog(`Clipboard uploaded image ${i+1}/${blobs.length}: ${name}`);
         }
@@ -449,38 +449,17 @@
   }
 
   /**
-   * Paste image into Gemini composer by constructing a ClipboardEvent
-   * with the blob data inline — no system clipboard read needed.
+   * Paste image into Gemini composer.
+   * Relies on copyImageToClipboard having already written to system clipboard.
+   * Gemini's own paste handler reads from system clipboard — synthetic
+   * ClipboardEvents with inline data are less reliable.
    */
-  async function pasteIntoComposer(composer, blob) {
+  async function pasteIntoComposer(composer) {
     // Focus the composer first
     composer.focus();
     await sleep(200);
 
-    // Method 1 (preferred): Dispatch ClipboardEvent with the blob data inline.
-    // This avoids needing user gesture for navigator.clipboard.read().
-    if (blob) {
-      try {
-        const dt = new DataTransfer();
-        const file = new File([blob], 'ref_image.png', { type: blob.type || 'image/png' });
-        dt.items.add(file);
-
-        const pasteEvent = new ClipboardEvent('paste', {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: dt,
-        });
-
-        composer.dispatchEvent(pasteEvent);
-        await sleep(800);
-        remoteLog('Inline ClipboardEvent dispatched with blob data');
-        return true;
-      } catch (err) {
-        remoteLog('Inline ClipboardEvent failed:', err.message);
-      }
-    }
-
-    // Method 2: Dispatch Ctrl+V keydown (triggers Gemini's paste handler)
+    // Method 1: Dispatch Ctrl+V keydown (Gemini picks up from system clipboard)
     const isMac = navigator.platform.includes('Mac');
     const ctrlKey = !isMac;
     const metaKey = isMac;
@@ -490,31 +469,12 @@
       ctrlKey, metaKey, bubbles: true, cancelable: true,
     }));
 
-    // Method 3: Attempt to read clipboard and re-dispatch (may fail without gesture)
-    try {
-      const clipboardItems = await navigator.clipboard.read();
-      if (clipboardItems.length > 0) {
-        const item = clipboardItems[0];
-        const types = item.types;
-
-        for (const type of types) {
-          const blobItem = await item.getType(type);
-          const pe = new ClipboardEvent('paste', {
-            bubbles: true, cancelable: true,
-            clipboardData: new DataTransfer(),
-          });
-          try { pe.clipboardData.items.add(blobItem, type); } catch {}
-          composer.dispatchEvent(pe);
-        }
-      }
-    } catch (err) {
-      remoteLog('Clipboard read fallback error:', err.message);
-    }
-
-    // Method 4: execCommand paste (deprecated but kept as last resort)
+    // Method 2: document.execCommand('paste') reads from system clipboard
     try {
       document.execCommand('paste');
-    } catch {}
+    } catch (e) {
+      remoteLog('execCommand paste failed:', e.message);
+    }
 
     await sleep(1000);
     return true;
