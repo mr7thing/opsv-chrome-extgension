@@ -10,8 +10,28 @@ let isAutoMode = true;
 let isRunning = false;
 let currentJob = null;
 let watermarkEngine = null;
-let queuedJobs = [];     // { id, prompt, reference_files, watermark_removal, status, result_files }
+let queuedJobs = [];     // { id, prompt, reference_files, watermark_removal, status, result_files, batchId, _selected }
+let batches = [];        // { id, color, sentAt, jobIds }
+let activeBatchId = null;
+let lastReportBatchId = null;
 let daemonWsUrl = DAEMON_WS_DEFAULT; // resolved dynamically
+
+// Filter & selection state
+let activeFilter = 'all';
+let searchQuery = '';
+let selectedJobIds = new Set();
+
+// 9-rotation palette (HSL gold/pink/teal/orange/purple/lime/blue/magenta/cyan)
+const BATCH_COLORS = [
+  '#ff6b6b', '#4ecdc4', '#ffe66d', '#a8e6cf', '#ff8ed4',
+  '#c9a0ff', '#7ee787', '#79c0ff', '#f78166'
+];
+let _batchColorIdx = 0;
+function nextBatchColor() {
+  const c = BATCH_COLORS[_batchColorIdx % BATCH_COLORS.length];
+  _batchColorIdx++;
+  return c;
+}
 
 // ── DOM ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +43,10 @@ const modeAutoBtn = document.getElementById('mode-auto');
 const modeManualBtn = document.getElementById('mode-manual');
 const modeLabel = document.getElementById('mode-label');
 const removeWatermarkCb = document.getElementById('remove-watermark-cb');
+const batchBannerEl = document.getElementById('batch-banner');
+const batchHistoryEl = document.getElementById('batch-history');
+const searchInputEl = document.getElementById('search-input');
+const batchToolbarEl = document.getElementById('batch-toolbar');
 
 // ── State persistence ─────────────────────────────────────────────────────
 
@@ -129,15 +153,29 @@ function handleMsg(msg) {
       // If a job id already exists, reset its status to 'pending' (it'll be retried).
       const incomingIds = new Set((msg.jobs || []).map(j => j.id).filter(Boolean));
       queuedJobs = queuedJobs.filter(j => !incomingIds.has(j.id)); // drop dupes
+
+      // Create a new batch
+      const batchId = `b${Date.now().toString(36)}`;
+      const batch = {
+        id: batchId,
+        color: nextBatchColor(),
+        sentAt: new Date(),
+        jobIds: (msg.jobs || []).map(j => j.id).filter(Boolean)
+      };
+      batches.push(batch);
+      activeBatchId = batchId;
+
       queuedJobs = queuedJobs.concat((msg.jobs || []).map(j => ({
         id: j.id,
         prompt: j.prompt || '',
         reference_files: j.reference_files || [],
         watermark_removal: j.watermark_removal !== false,
         status: 'pending',
-        result_files: []
+        result_files: [],
+        batchId: batchId
       })));
       renderJobs();
+      renderBatches();
       if (isAutoMode && !isRunning) runNextJob();
       break;
     case 'JOB_COMPLETE':
@@ -208,9 +246,63 @@ function updateJobStatus(jobId, status) {
   const job = queuedJobs.find(j => j.id === jobId);
   if (job) job.status = status;
   renderJobs();
+  renderBatches();
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
+
+function renderBatches() {
+  if (!batchBannerEl || !batchHistoryEl) return;
+
+  // Active batch banner
+  const active = batches.find(b => b.id === activeBatchId);
+  if (!active) {
+    batchBannerEl.innerHTML = '';
+    batchHistoryEl.innerHTML = '';
+    return;
+  }
+
+  const activeJobs = queuedJobs.filter(j => j.batchId === active.id);
+  const done = activeJobs.filter(j => j.status === 'done').length;
+  const failed = activeJobs.filter(j => j.status === 'failed').length;
+  const running = activeJobs.filter(j => j.status === 'running').length;
+  const total = activeJobs.length;
+  const isComplete = (done + failed) >= total && total > 0;
+  const pct = total === 0 ? 0 : Math.round(((done + failed) / total) * 100);
+  const ts = active.sentAt.toLocaleTimeString();
+
+  batchBannerEl.innerHTML = `
+    <div class="batch-banner ${isComplete ? 'complete' : ''}" style="--batch-color: ${active.color}">
+      <div class="batch-banner-row">
+        <span>
+          <span class="batch-color-dot" style="background:${active.color}"></span>
+          <strong>Batch ${active.id}</strong> · ${ts}
+        </span>
+        <span>${done + failed}/${total} ${isComplete ? (failed > 0 ? '⚠ has failures' : '✓ all done') : 'running'}</span>
+      </div>
+      <div class="batch-progress-bar">
+        <div class="batch-progress-fill" style="width: ${pct}%; --batch-color: ${active.color}"></div>
+      </div>
+      ${!isComplete ? `<div style="font-size:10px;color:#888;margin-top:3px;">✓ ${done} done · ❌ ${failed} failed · ⏵ ${running} running · ⏸ ${total - done - failed - running} pending</div>` : ''}
+    </div>`;
+
+  // Batch history (collapsed past batches)
+  const historyBatches = batches.filter(b => b.id !== activeBatchId).slice(-5);
+  if (historyBatches.length > 0) {
+    batchHistoryEl.innerHTML = historyBatches.map(b => {
+      const bj = queuedJobs.filter(j => j.batchId === b.id);
+      const bd = bj.filter(j => j.status === 'done').length;
+      const bf = bj.filter(j => j.status === 'failed').length;
+      return `<div class="batch-history-item" data-batch-id="${b.id}">
+        <span class="batch-color-dot" style="background:${b.color};width:8px;height:8px;"></span>
+        <span>${b.id}</span>
+        <span>${bd}✓ ${bf}✗</span>
+      </div>`;
+    }).join('');
+  } else {
+    batchHistoryEl.innerHTML = '';
+  }
+}
 
 function renderJobs() {
   jobListEl.innerHTML = '';
@@ -223,9 +315,21 @@ function renderJobs() {
   }
 
   for (const job of queuedJobs) {
+    // Apply filter
+    if (activeFilter !== 'all' && job.status !== activeFilter) continue;
+    // Apply search
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      const matchId = job.id?.toLowerCase().includes(q);
+      const matchPrompt = job.prompt?.toLowerCase().includes(q);
+      if (!matchId && !matchPrompt) continue;
+    }
+
     const div = document.createElement('div');
     div.className = `job-item ${job.status}`;
     div.dataset.jobId = job.id;
+
+    const checked = selectedJobIds.has(job.id) ? 'checked' : '';
 
     // Build reference thumbnails
     let thumbsHtml = '';
@@ -281,9 +385,15 @@ function renderJobs() {
       ? '<span class="job-modified-marker" title="User-modified prompt or attachments">✏ MODIFIED</span>'
       : '';
 
+    const jobBatch = batches.find(b => b.id === job.batchId);
+    const batchDot = jobBatch
+      ? `<span class="batch-color-dot" style="background:${jobBatch.color};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;" title="Batch ${jobBatch.id}"></span>`
+      : '';
+
     div.innerHTML = `
+      <input type="checkbox" class="job-checkbox" data-job-id="${job.id}" ${checked}>
       <div class="job-desc">
-        <span class="job-id">${escapeHtml(job.id)}${modifiedMarker}</span>
+        <span class="job-id">${batchDot}${escapeHtml(job.id)}${modifiedMarker}</span>
         <div class="job-prompt-text" title="点击编辑提示词和附件">${escapeHtml(job.prompt)}</div>
         ${thumbsContainer}
       </div>
@@ -294,6 +404,7 @@ function renderJobs() {
           <button class="btn-action-sm btn-inject" data-job-id="${job.id}" title="一键注入图片和文字（不发送）">⚡ Inject</button>
           ${job.status === 'failed' || job.status === 'done' ? `<button class="btn-action-sm btn-retry" data-job-id="${job.id}">🔄 Retry</button>` : ''}
           ${job.status === 'pending' ? `<button class="btn-action-sm btn-run" data-job-id="${job.id}">▶ Run</button>` : ''}
+          ${job.status === 'frozen' ? `<button class="btn-action-sm btn-unfreeze" data-job-id="${job.id}">🔓 Unfreeze</button>` : (job.status === 'pending' || job.status === 'failed' || job.status === 'done' ? `<button class="btn-action-sm btn-freeze" data-job-id="${job.id}" title="冻结 (跳过本批执行)">❄️ Freeze</button>` : '')}
           <button class="btn-action-sm btn-remove" data-job-id="${job.id}" title="从队列删除">✕</button>
         </div>
       </div>`;
@@ -387,8 +498,37 @@ function renderJobs() {
           return;
         }
         queuedJobs = queuedJobs.filter(j => j.id !== job.id);
+        selectedJobIds.delete(job.id);
         renderJobs();
+        updateBatchToolbar();
       });
+    }
+
+    const freezeBtn = div.querySelector('.btn-freeze');
+    if (freezeBtn) {
+      freezeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        freezeJob(job.id);
+      });
+    }
+    const unfreezeBtn = div.querySelector('.btn-unfreeze');
+    if (unfreezeBtn) {
+      unfreezeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        unfreezeJob(job.id);
+      });
+    }
+
+    const checkbox = div.querySelector('.job-checkbox');
+    if (checkbox) {
+      checkbox.addEventListener('change', (e) => {
+        e.stopPropagation();
+        if (checkbox.checked) selectedJobIds.add(job.id);
+        else selectedJobIds.delete(job.id);
+        updateBatchToolbar();
+      });
+      // Prevent the row click from toggling the checkbox
+      checkbox.addEventListener('click', (e) => e.stopPropagation());
     }
 
     // ── Per-job drop target for result images ──
@@ -531,10 +671,10 @@ async function runJobExecutor(job) {
 
 async function runNextJob() {
   if (isRunning) return;
-  const pending = queuedJobs.find(j => j.status === 'pending');
+  const pending = queuedJobs.find(j => j.status === 'pending'); // frozen skipped
   if (!pending) {
     isRunning = false;
-    // All jobs complete — show DONE badge
+    // All jobs complete — show DONE badge + batch report
     const allDone = queuedJobs.every(j => j.status === 'done' || j.status === 'failed');
     if (allDone && queuedJobs.length > 0 && chrome.action) {
       chrome.action.setBadgeText({ text: 'DONE' });
@@ -542,6 +682,25 @@ async function runNextJob() {
     }
     stopBtn.style.display = 'none';
     runAllBtn.style.display = 'block';
+
+    // Batch completion: report to user + Agent (in auto mode)
+    if (isAutoMode && allDone && queuedJobs.length > 0 && activeBatchId && activeBatchId !== lastReportBatchId) {
+      lastReportBatchId = activeBatchId;
+      const batch = batches.find(b => b.id === activeBatchId);
+      const bj = queuedJobs.filter(j => j.batchId === activeBatchId);
+      const bd = bj.filter(j => j.status === 'done');
+      const bf = bj.filter(j => j.status === 'failed');
+      const elapsed = batch ? Math.round((Date.now() - batch.sentAt.getTime()) / 1000) : 0;
+
+      // Switch to manual so the queue stops after this batch
+      switchToManualMode();
+
+      // Show report panel
+      showBatchReport(batch, bd, bf, elapsed);
+
+      // Send report to daemon (→ opsv CLI / Agent)
+      sendBatchReportToAgent(batch, bd, bf, elapsed);
+    }
     return;
   }
   await runJobExecutor(pending);
@@ -718,6 +877,238 @@ if (clearDoneBtn) {
     const removed = before - queuedJobs.length;
     renderJobs();
     remoteLog(`Cleared ${removed} done/failed task(s)`);
+  });
+}
+
+initFiltersAndSelection();
+
+// ── Batch report panel ───────────────────────────────────────────────────
+
+function showBatchReport(batch, done, failed, elapsedSec) {
+  const panel = document.createElement('div');
+  panel.className = `batch-report-panel ${failed.length > 0 ? 'failed-batch' : ''}`;
+  panel.id = 'batch-report-panel';
+
+  const ts = batch ? batch.sentAt.toLocaleTimeString() : '?';
+  const failedList = failed.map(j => j.id).join(', ') || '—';
+  const doneList = done.map(j => j.id).join(', ') || '—';
+
+  panel.innerHTML = `
+    <div class="batch-report-title">
+      <span class="batch-color-dot" style="background:${batch?.color || '#888'}; display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px;"></span>
+      Batch ${batch?.id || '?'} 完成 · ${ts}
+    </div>
+    <div class="batch-report-stats">
+      ✓ <strong style="color:#7ee787;">${done.length}</strong> done ·
+      ✗ <strong style="color:#ff6b6b;">${failed.length}</strong> failed ·
+      ⏱ ${elapsedSec}s
+    </div>
+    <div style="font-size:10px; color:#888; margin-bottom:6px;">
+      Done: ${doneList}<br>
+      Failed: <span style="color:#ff6b6b;">${failedList}</span>
+    </div>
+    <div class="batch-report-actions">
+      ${failed.length > 0 ? '<button id="retry-failed-btn" class="btn-secondary">🔁 Retry Failed (' + failed.length + ')</button>' : ''}
+      <button id="copy-report-btn" class="btn-secondary">📋 Copy Report</button>
+      <button id="send-agent-btn" class="btn-secondary">📡 Send to Agent</button>
+      <button id="dismiss-report-btn" class="btn-secondary">✕ Dismiss</button>
+    </div>
+  `;
+
+  // Replace any existing report
+  const old = document.getElementById('batch-report-panel');
+  if (old) old.remove();
+  if (batchBannerEl && batchBannerEl.parentNode) {
+    batchBannerEl.parentNode.insertBefore(panel, batchBannerEl.nextSibling);
+  }
+
+  // Wire buttons
+  const retryBtn = panel.querySelector('#retry-failed-btn');
+  if (retryBtn) {
+    retryBtn.addEventListener('click', () => {
+      retryFailedBatch(batch.id);
+      panel.remove();
+    });
+  }
+  panel.querySelector('#copy-report-btn')?.addEventListener('click', () => {
+    const text = formatBatchReportText(batch, done, failed, elapsedSec);
+    navigator.clipboard.writeText(text).then(() => alert('Report copied to clipboard'));
+  });
+  panel.querySelector('#send-agent-btn')?.addEventListener('click', () => {
+    sendBatchReportToAgent(batch, done, failed, elapsedSec, true);
+    alert('Report sent to agent via daemon.');
+  });
+  panel.querySelector('#dismiss-report-btn')?.addEventListener('click', () => {
+    panel.remove();
+  });
+}
+
+function formatBatchReportText(batch, done, failed, elapsedSec) {
+  const ts = batch ? batch.sentAt.toISOString() : '?';
+  return [
+    `# OpsV Batch Report — ${batch?.id || '?'}`,
+    `Sent: ${ts}`,
+    `Elapsed: ${elapsedSec}s`,
+    ``,
+    `✓ DONE (${done.length}): ${done.map(j => j.id).join(', ') || '—'}`,
+    `✗ FAILED (${failed.length}): ${failed.map(j => j.id).join(', ') || '—'}`,
+    ``,
+    `Agent decision: retry_failed | manual_fix | accept`
+  ].join('\n');
+}
+
+function sendBatchReportToAgent(batch, done, failed, elapsedSec, manual = false) {
+  const report = {
+    type: 'OPSV_REPORT',
+    batchId: batch?.id,
+    color: batch?.color,
+    sentAt: batch?.sentAt?.toISOString(),
+    elapsedSec,
+    done: done.map(j => ({ id: j.id })),
+    failed: failed.map(j => ({ id: j.id, prompt: j.prompt?.slice(0, 200) })),
+    manual: !!manual
+  };
+  // Send via WS to daemon → daemon writes to /tmp/opsv-reports/<batchId>.json
+  sendWs(report);
+  remoteLog(`Batch report sent: ${batch?.id} (${done.length}✓ ${failed.length}✗)`);
+}
+
+function retryFailedBatch(batchId) {
+  const bf = queuedJobs.filter(j => j.batchId === batchId && j.status === 'failed');
+  if (bf.length === 0) return;
+
+  // Reset failed → pending (in same batch — keeps color continuity)
+  bf.forEach(j => { j.status = 'pending'; });
+  renderJobs();
+  renderBatches();
+
+  // Switch back to auto mode
+  isAutoMode = true;
+  modeAutoBtn.classList.add('active');
+  modeManualBtn.classList.remove('active');
+  modeLabel.textContent = 'AUTO';
+  lastReportBatchId = null; // allow new report when this retry completes
+
+  // Kick off
+  if (!isRunning) runNextJob();
+  remoteLog(`Retrying ${bf.length} failed job(s) from batch ${batchId}`);
+}
+
+function freezeJob(jobId) {
+  const j = queuedJobs.find(x => x.id === jobId);
+  if (!j) return;
+  if (j.status === 'running') return; // can't freeze running
+  j.status = 'frozen';
+  renderJobs();
+  renderBatches();
+  updateBatchToolbar();
+  remoteLog(`Froze job: ${jobId}`);
+}
+
+function unfreezeJob(jobId) {
+  const j = queuedJobs.find(x => x.id === jobId);
+  if (!j) return;
+  if (j.status !== 'frozen') return;
+  j.status = 'pending';
+  renderJobs();
+  renderBatches();
+  updateBatchToolbar();
+  remoteLog(`Unfroze job: ${jobId}`);
+}
+
+// ── Batch toolbar + filters ─────────────────────────────────────────────────
+
+function updateBatchToolbar() {
+  if (!batchToolbarEl) return;
+  const n = selectedJobIds.size;
+  batchToolbarEl.querySelector('.selected-count').textContent = `${n} selected`;
+  if (n > 0) batchToolbarEl.classList.add('visible');
+  else batchToolbarEl.classList.remove('visible');
+}
+
+function getSelectedJobs() {
+  return queuedJobs.filter(j => selectedJobIds.has(j.id));
+}
+
+function batchFreeze() {
+  const jobs = getSelectedJobs().filter(j => j.status !== 'running');
+  jobs.forEach(j => { j.status = 'frozen'; });
+  renderJobs();
+  renderBatches();
+  updateBatchToolbar();
+  remoteLog(`Batch froze ${jobs.length} job(s)`);
+}
+
+function batchUnfreeze() {
+  const jobs = getSelectedJobs().filter(j => j.status === 'frozen');
+  jobs.forEach(j => { j.status = 'pending'; });
+  renderJobs();
+  renderBatches();
+  updateBatchToolbar();
+  remoteLog(`Batch unfroze ${jobs.length} job(s)`);
+}
+
+function batchDelete() {
+  if (!confirm(`Delete ${selectedJobIds.size} selected job(s)?`)) return;
+  const removable = getSelectedJobs().filter(j => j.status !== 'running');
+  queuedJobs = queuedJobs.filter(j => !selectedJobIds.has(j.id) || j.status === 'running');
+  selectedJobIds.clear();
+  renderJobs();
+  updateBatchToolbar();
+  remoteLog(`Batch deleted ${removable.length} job(s)`);
+}
+
+function batchRun() {
+  // Reset selected failed/done/frozen → pending, then run
+  const jobs = getSelectedJobs();
+  jobs.forEach(j => {
+    if (j.status === 'failed' || j.status === 'done' || j.status === 'frozen') {
+      j.status = 'pending';
+    }
+  });
+  renderJobs();
+  renderBatches();
+  updateBatchToolbar();
+  // Switch to auto + kick off
+  isAutoMode = true;
+  modeAutoBtn.classList.add('active');
+  modeManualBtn.classList.remove('active');
+  modeLabel.textContent = 'AUTO';
+  lastReportBatchId = null;
+  if (!isRunning) runNextJob();
+  remoteLog(`Batch run: ${jobs.length} job(s) queued`);
+}
+
+// Init filter chips + search input + batch toolbar buttons
+function initFiltersAndSelection() {
+  document.querySelectorAll('.filter-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      activeFilter = chip.dataset.filter;
+      renderJobs();
+    });
+  });
+  if (searchInputEl) {
+    searchInputEl.addEventListener('input', () => {
+      searchQuery = searchInputEl.value;
+      renderJobs();
+    });
+  }
+
+  const bf = document.getElementById('batch-freeze-btn');
+  if (bf) bf.addEventListener('click', batchFreeze);
+  const buf = document.getElementById('batch-unfreeze-btn');
+  if (buf) buf.addEventListener('click', batchUnfreeze);
+  const br = document.getElementById('batch-run-btn');
+  if (br) br.addEventListener('click', batchRun);
+  const bd = document.getElementById('batch-delete-btn');
+  if (bd) bd.addEventListener('click', batchDelete);
+  const bc = document.getElementById('batch-clear-sel-btn');
+  if (bc) bc.addEventListener('click', () => {
+    selectedJobIds.clear();
+    renderJobs();
+    updateBatchToolbar();
   });
 }
 

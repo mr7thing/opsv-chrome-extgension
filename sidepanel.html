@@ -111,7 +111,73 @@
     .job-item.done { background-color: #0d2818; }
     .job-item.failed { background-color: #2e1111; }
     .job-item.running { background-color: #1a1a3e; }
+    .job-item.frozen { background-color: #1a2030; opacity: 0.55; }
+    .job-item.frozen .job-id { color: #79c0ff; }
     .job-item.dragover { border: 2px dashed #7b8cff; background-color: #1a1a3e; }
+    .job-checkbox {
+      cursor: pointer;
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+    }
+    .batch-toolbar {
+      display: none;
+      padding: 6px 8px;
+      background: #1a1a3e;
+      border: 1px solid #7b8cff;
+      border-radius: 4px;
+      margin-top: 6px;
+      gap: 4px;
+      align-items: center;
+      font-size: 11px;
+    }
+    .batch-toolbar.visible { display: flex; }
+    .batch-toolbar .selected-count {
+      color: #7b8cff;
+      margin-right: 4px;
+    }
+    .batch-toolbar button {
+      padding: 4px 8px;
+      background: #3a3a3a;
+      color: #ccc;
+      border: 1px solid #555;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .batch-toolbar button:hover { background: #555; color: #fff; }
+    .filter-bar {
+      display: flex;
+      gap: 4px;
+      margin-top: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .filter-chip {
+      padding: 3px 8px;
+      background: #2a2a3e;
+      color: #aaa;
+      border: 1px solid #444;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 10px;
+    }
+    .filter-chip.active {
+      background: #4a3a7e;
+      color: #fff;
+      border-color: #7b8cff;
+    }
+    .search-input {
+      flex: 1;
+      min-width: 100px;
+      padding: 3px 8px;
+      background: #1a1a2e;
+      color: #ddd;
+      border: 1px solid #444;
+      border-radius: 10px;
+      font-size: 11px;
+    }
+    .job-status.frozen { background: #4a6a8a; color: #fff; }
 
     .job-desc {
       font-size: 12px;
@@ -209,6 +275,89 @@
       align-items: center;
       flex-wrap: wrap;
       gap: 6px;
+    }
+    .batch-banner {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border-left: 4px solid var(--batch-color, #7b8cff);
+      background: rgba(123, 140, 255, 0.08);
+      font-size: 11px;
+      color: #ddd;
+    }
+    .batch-banner.complete {
+      opacity: 0.5;
+      background: rgba(100, 100, 100, 0.08);
+    }
+    .batch-banner-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .batch-color-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    .batch-progress-bar {
+      height: 4px;
+      background: #2a2a3e;
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .batch-progress-fill {
+      height: 100%;
+      background: var(--batch-color, #7b8cff);
+      transition: width 0.3s;
+    }
+    .batch-history-item {
+      margin-top: 4px;
+      padding: 4px 8px;
+      font-size: 10px;
+      color: #888;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .batch-history-item:hover {
+      color: #ccc;
+    }
+    .batch-report-panel {
+      margin-top: 10px;
+      padding: 10px;
+      background: #1a2e1a;
+      border: 1px solid #2d5a2d;
+      border-radius: 6px;
+      font-size: 11px;
+    }
+    .batch-report-panel.failed-batch {
+      background: #2e1a1a;
+      border-color: #5a2d2d;
+    }
+    .batch-report-title {
+      font-size: 12px;
+      font-weight: bold;
+      color: #fff;
+      margin-bottom: 6px;
+    }
+    .batch-report-stats {
+      color: #ccc;
+      margin-bottom: 8px;
+    }
+    .batch-report-actions {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .batch-report-actions button {
+      flex: 1;
+      min-width: 80px;
     }
     .btn-action {
       background: transparent;
@@ -535,7 +684,7 @@
 </head>
 <body>
   <div class="header">
-    <h3>OpsV Queue <span id="version-label" style="font-size:10px;color:#888;">v0.5.6</span></h3>
+    <h3>OpsV Queue <span id="version-label" style="font-size:10px;color:#888;">v0.5.7</span></h3>
     <div class="status-row">
       <span id="mode-label" style="font-size:10px;color:#888;">AUTO</span>
       <div id="status-indicator" class="status disconnected" title="Disconnected"></div>
@@ -553,6 +702,27 @@
     </label>
     <button id="clear-all-btn" class="btn-secondary" title="Clear all tasks from queue">🗑 Clear</button>
     <button id="clear-done-btn" class="btn-secondary" title="Remove completed/failed tasks">Clear Done</button>
+  </div>
+
+  <div id="batch-banner"></div>
+  <div id="batch-history"></div>
+
+  <div class="filter-bar">
+    <input type="text" id="search-input" class="search-input" placeholder="🔍 search id / prompt...">
+    <span class="filter-chip active" data-filter="all">All</span>
+    <span class="filter-chip" data-filter="pending">Pending</span>
+    <span class="filter-chip" data-filter="failed">Failed</span>
+    <span class="filter-chip" data-filter="done">Done</span>
+    <span class="filter-chip" data-filter="frozen">❄ Frozen</span>
+  </div>
+
+  <div id="batch-toolbar" class="batch-toolbar">
+    <span class="selected-count">0 selected</span>
+    <button id="batch-freeze-btn">❄ Freeze</button>
+    <button id="batch-unfreeze-btn">🔓 Unfreeze</button>
+    <button id="batch-run-btn">▶ Run</button>
+    <button id="batch-delete-btn">🗑 Delete</button>
+    <button id="batch-clear-sel-btn" style="margin-left:auto;">✕ Clear</button>
   </div>
 
   <div id="job-list" class="job-list">

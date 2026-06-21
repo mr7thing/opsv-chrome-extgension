@@ -164,6 +164,18 @@ function handleWsMessage(ws, data) {
     console.log(`[Extension Log]: ${data.message}`);
   } else if (mtype === 'JOB_STARTED') {
     console.log(`Job started in extension: ${data.shotId}`);
+  } else if (mtype === 'OPSV_REPORT') {
+    // Sidepanel finished a batch and is reporting back to opsv CLI / Agent.
+    // Write to /tmp/opsv-reports/<batchId>.json so opsv CLI can tail/poll.
+    try {
+      const dir = '/tmp/opsv-reports';
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const fname = `${dir}/${data.batchId || Date.now()}.json`;
+      fs.writeFileSync(fname, JSON.stringify(data, null, 2));
+      console.log(`[OPSV_REPORT] Written ${fname} (${data.done?.length || 0}✓ ${data.failed?.length || 0}✗)`);
+    } catch (err) {
+      console.error(`[OPSV_REPORT] Write failed: ${err.message}`);
+    }
   } else if (mtype === 'ASSET_SAVED') {
     const shotId = data.shotId;
     const paths = data.paths || [];
