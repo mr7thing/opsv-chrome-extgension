@@ -100,12 +100,10 @@
       // Step 1: Upload reference images if any
       if (refFiles.length > 0) {
         remoteLog(`Uploading ${refFiles.length} reference image(s)...`);
-        for (const fileUrl of refFiles) {
-          const ok = await uploadReferenceImage(fileUrl);
-          if (!ok) {
-            throw new Error(`Failed to upload reference: ${fileUrl}`);
-          }
-          await sleep(2000);
+        // Try batch upload (composite to single grid then drag-drop)
+        const ok = await uploadReferenceImagesBatch(refFiles);
+        if (!ok) {
+          throw new Error('Failed to upload reference images');
         }
         remoteLog('All reference images uploaded and confirmed ready');
       }
@@ -184,11 +182,16 @@
     }
   }
 
-  // ── Reference Image Upload via Clipboard ───────────────────────────────
+  // ── Reference Image Upload via Drag & Drop (primary) ──────────────────
+  /**
+   * Upload a single reference image by simulating a drag-and-drop on the Gemini composer.
+   * Gemini natively handles dropped files and starts the upload process.
+   * This avoids clipboard permission issues and user gesture requirements.
+   */
   async function uploadReferenceImage(fileUrl) {
     try {
       // Step 1: Fetch the image from daemon
-      let safePath = fileUrl.replace(/\\/g, '/');
+      let safePath = fileUrl.replace(/\\\\/g, '/');
       if (!safePath.startsWith('/')) safePath = '/' + safePath;
       const httpUrl = DAEMON_FILES + safePath;
       remoteLog(`Fetching reference: ${httpUrl}`);
@@ -198,59 +201,76 @@
         return false;
       }
 
-      // Step 2: Copy to clipboard as image
-      await copyImageToClipboard(blob);
-
-      // Step 3: Find and focus Gemini input
+      // Step 2: Find Gemini composer
       const composer = findComposer();
       if (!composer) {
         remoteLog('Composer not found');
         return false;
       }
       focusComposer(composer);
+      await sleep(300);
 
-      // Step 4: Paste
-      await sleep(500);
-      const pasted = await pasteIntoComposer(composer);
-      if (pasted) {
-        remoteLog('Paste successful');
-
-        // Step 5: Wait for upload preview to appear
-        await waitForUploadPreview(blob);
-        remoteLog('Upload preview confirmed');
+      // Step 3: Upload via drag-and-drop
+      const uploaded = await uploadViaDragDrop(blob, fileUrl.split('/').pop() || 'ref_image.png');
+      if (uploaded) {
+        remoteLog('Drag-drop upload successful');
         return true;
       }
 
-      // Fallback: Try clicking the upload button
-      remoteLog('Clipboard paste not detected, trying upload button...');
-      const uploadBtn = findUploadButton();
-      if (uploadBtn) {
-        uploadBtn.click();
-        await sleep(1000);
-
-        // After clicking upload, Gemini may open a file picker
-        // Check if there's a hidden file input we can use
-        const fileInput = findHiddenFileInput();
-        if (fileInput) {
-          const file = new File([blob], 'ref_image.png', { type: blob.type || 'image/png' });
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileInput.files = dt.files;
-          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-          // Wait for upload preview with status tracking
-          const uploaded = await waitForUploadPreview(blob);
-          if (uploaded) {
-            remoteLog('File input upload confirmed');
-            return true;
-          }
-        }
-      }
-
-      remoteLog('All upload methods failed');
-      return false;
+      // Step 4: Fallback to clipboard paste
+      remoteLog('Drag-drop failed, trying clipboard paste...');
+      return await uploadViaClipboardFallback([fileUrl]);
     } catch (err) {
       remoteLog('uploadReferenceImage error:', err.message);
+      return false;
+    }
+  }
+
+  /**
+   * Simulate a file drop on the composer element.
+   * Creates a proper DragEvent with a DataTransfer containing the image File.
+   */
+  async function uploadViaDragDrop(blob, filename) {
+    try {
+      const composer = findComposer();
+      if (!composer) return false;
+
+      // Create a File object from the blob
+      const file = new File([blob], filename, { type: blob.type || 'image/png' });
+      
+      // Create DataTransfer with the file
+      const dt = new DataTransfer();
+      dt.items.add(file);
+
+      remoteLog(`Simulating drag-drop for ${filename} (${(blob.size / 1024).toFixed(0)}KB)`);
+
+      // Dispatch drag events in sequence (what Gemini expects)
+      composer.dispatchEvent(new DragEvent('dragenter', {
+        dataTransfer: dt, bubbles: true, cancelable: true
+      }));
+      await sleep(100);
+
+      composer.dispatchEvent(new DragEvent('dragover', {
+        dataTransfer: dt, bubbles: true, cancelable: true
+      }));
+      await sleep(100);
+
+      composer.dispatchEvent(new DragEvent('drop', {
+        dataTransfer: dt, bubbles: true, cancelable: true
+      }));
+      await sleep(500);
+
+      // Step 4: Wait for upload preview to appear
+      const confirmed = await waitForUploadPreview(blob);
+      if (confirmed) {
+        remoteLog('Drag-drop upload preview confirmed');
+        return true;
+      }
+
+      remoteLog('Drag-drop: no upload preview detected');
+      return false;
+    } catch (err) {
+      remoteLog('uploadViaDragDrop error:', err.message);
       return false;
     }
   }
@@ -264,6 +284,99 @@
       remoteLog('fetchImage error:', err.message);
       return null;
     }
+  }
+
+  // ── Batch Upload: composite + drag-drop ────────────────────────────────
+  /**
+   * Batch upload multiple reference images by compositing into a single grid image.
+   * Gemini only keeps the last pasted/dropped image, so we merge all refs into one.
+   * Then uploads the composite via drag-and-drop (no clipboard/user gesture needed).
+   */
+  async function uploadReferenceImagesBatch(fileUrls) {
+    try {
+      // Step 1: Download all blobs from daemon
+      const blobs = [];
+      for (const fileUrl of fileUrls) {
+        let safePath = fileUrl.replace(/\\\\/g, '/');
+        if (!safePath.startsWith('/')) safePath = '/' + safePath;
+        const httpUrl = DAEMON_FILES + safePath;
+        remoteLog(`Fetching reference: ${httpUrl}`);
+        const blob = await fetchImage(httpUrl);
+        if (blob) {
+          blobs.push(blob);
+        } else {
+          remoteLog(`Failed to fetch image: ${fileUrl}`);
+        }
+      }
+      if (blobs.length === 0) {
+        remoteLog('No reference images could be downloaded');
+        return false;
+      }
+      remoteLog(`Downloaded ${blobs.length}/${fileUrls.length} reference images`);
+
+      // Step 2: Composite all images into a single grid image
+      const compositeBlob = await compositeImagesToGrid(blobs);
+      if (!compositeBlob) {
+        remoteLog('Composite failed, trying per-file drag-drop...');
+        return await uploadFilesViaDragDrop(blobs, fileUrls);
+      }
+      remoteLog(`Composite image: ${compositeBlob.size} bytes`);
+
+      // Step 3: Upload the single composite via drag-drop
+      return await uploadViaDragDrop(compositeBlob, 'composite_ref_grid.png');
+    } catch (err) {
+      remoteLog('uploadReferenceImagesBatch error:', err.message);
+      return await uploadFilesViaDragDrop(blobs, fileUrls);
+    }
+  }
+
+  /**
+   * Composite multiple images into a single grid (max 3 per row).
+   */
+  async function compositeImagesToGrid(blobs) {
+    try {
+      const images = await Promise.all(blobs.map(b => blobToImage(b)));
+      const cols = Math.min(images.length, 3);
+      const rows = Math.ceil(images.length / cols);
+      const cellW = 400;
+      const cellH = 400;
+      const gap = 8;
+      const canvas = document.createElement('canvas');
+      canvas.width = cols * cellW + (cols - 1) * gap;
+      canvas.height = rows * cellH + (rows - 1) * gap;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      for (let i = 0; i < images.length; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = col * (cellW + gap);
+        const y = row * (cellH + gap);
+        const img = images[i];
+        const scale = Math.min(cellW / img.naturalWidth, cellH / img.naturalHeight);
+        const drawW = img.naturalWidth * scale;
+        const drawH = img.naturalHeight * scale;
+        ctx.drawImage(img, x + (cellW - drawW) / 2, y + (cellH - drawH) / 2, drawW, drawH);
+      }
+      return new Promise((resolve) => { canvas.toBlob(resolve, 'image/png'); });
+    } catch (err) {
+      remoteLog('compositeImagesToGrid error:', err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Fallback: upload each blob via per-file drag-drop.
+   */
+  async function uploadFilesViaDragDrop(blobs, fileUrls) {
+    let anyOk = false;
+    for (let i = 0; i < blobs.length; i++) {
+      const name = fileUrls[i] ? fileUrls[i].split('/').pop() : `ref_${i}.png`;
+      const ok = await uploadViaDragDrop(blobs[i], name);
+      if (ok) anyOk = true;
+      await sleep(2000); // space between uploads
+    }
+    return anyOk;
   }
 
   async function copyImageToClipboard(blob) {
