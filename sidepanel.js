@@ -419,8 +419,11 @@ function renderJobs() {
   }
 
   const pending = queuedJobs.filter(j => j.status === 'pending').length;
-  runAllBtn.disabled = pending === 0;
-  runAllBtn.textContent = `▶ Run All (${pending})`;
+  const failed = queuedJobs.filter(j => j.status === 'failed').length;
+  const actionable = pending + failed;
+  runAllBtn.disabled = actionable === 0;
+  runAllBtn.textContent = `▶ Run All (${actionable})`;
+  if (failed > 0 && pending === 0) runAllBtn.textContent = `▶ Retry All (${failed})`;
 }
 
 function escapeHtml(s) {
