@@ -172,6 +172,11 @@ function addJob(job) {
     existing.watermark_removal = job.watermark_removal ?? true;
     existing.status = 'pending';
     existing.result_files = [];
+    // Reset modification tracking when CLI sends a fresh batch
+    existing._originalPrompt = existing.prompt;
+    existing._originalRefs = [...existing.reference_files];
+    existing._modifiedPrompt = null;
+    existing._modifiedRefs = null;
   } else {
     queuedJobs.push({
       id: job.id,
@@ -179,7 +184,12 @@ function addJob(job) {
       reference_files: job.reference_files || [],
       watermark_removal: job.watermark_removal ?? true,
       status: 'pending',
-      result_files: []
+      result_files: [],
+      // Track original (from CLI) vs modified (from user via editor)
+      _originalPrompt: job.prompt || '',
+      _originalRefs: [...(job.reference_files || [])],
+      _modifiedPrompt: null,
+      _modifiedRefs: null,
     });
   }
 
@@ -262,15 +272,22 @@ function renderJobs() {
         ${resultThumbsHtml ? `<div class="thumb-section"><span class="thumb-label">Result:</span>${resultThumbsHtml}</div>` : ''}
       </div>`;
 
+    // Build modified marker
+    const isModified = job._modifiedPrompt !== null || job._modifiedRefs !== null;
+    const modifiedMarker = isModified
+      ? '<span class="job-modified-marker" title="User-modified prompt or attachments">✏ MODIFIED</span>'
+      : '';
+
     div.innerHTML = `
       <div class="job-desc">
-        <span class="job-id">${escapeHtml(job.id)}</span>
-        <div class="job-prompt-text" title="点击单独注入提示词到输入框">${escapeHtml(job.prompt)}</div>
+        <span class="job-id">${escapeHtml(job.id)}${modifiedMarker}</span>
+        <div class="job-prompt-text" title="点击编辑提示词和附件">${escapeHtml(job.prompt)}</div>
         ${thumbsContainer}
       </div>
       <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
         <span class="job-status ${job.status}">${job.status.toUpperCase()}</span>
         <div class="job-actions">
+          <button class="btn-action-sm btn-edit" data-job-id="${job.id}" title="编辑提示词和附件">✏️ Edit</button>
           <button class="btn-action-sm btn-inject" data-job-id="${job.id}" title="一键注入图片和文字（不发送）">⚡ Inject</button>
           ${job.status === 'failed' || job.status === 'done' ? `<button class="btn-action-sm btn-retry" data-job-id="${job.id}">🔄 Retry</button>` : ''}
           ${job.status === 'pending' ? `<button class="btn-action-sm btn-run" data-job-id="${job.id}">▶ Run</button>` : ''}
@@ -279,13 +296,18 @@ function renderJobs() {
 
     // ── Bind Click Listeners for Manual Editing ──
 
-    // 1. Click prompt to inject text
+    // 1. Click prompt OR Edit button → open full-screen editor modal
     const promptTextEl = div.querySelector('.job-prompt-text');
     if (promptTextEl) {
       promptTextEl.addEventListener('click', () => {
-        // 点击文本自动切换成手动模式注入
-        switchToManualMode();
-        injectPromptText(job);
+        openPromptEditor(job.id);
+      });
+    }
+    const editBtn = div.querySelector('.btn-edit');
+    if (editBtn) {
+      editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openPromptEditor(job.id);
       });
     }
 
@@ -369,12 +391,16 @@ function renderJobs() {
       for (const f of files) {
         if (!f.type.startsWith('image/')) continue;
         const dataUrl = await fileToDataUrl(f);
-        // Send incremental result to daemon
+        // Send incremental result to daemon with modification context
         sendWs({
           type: 'INCREMENTAL_RESULT',
           shotId: job.id,
           fileName: f.name,
           dataUrl: dataUrl,
+          originalPrompt: job._originalPrompt || job.prompt,
+          modifiedPrompt: job._modifiedPrompt,
+          originalRefs: job._originalRefs || job.reference_files,
+          modifiedRefs: job._modifiedRefs,
         });
         remoteLog(`Result dropped on job ${job.id}: ${f.name}`);
       }
@@ -447,9 +473,17 @@ async function runJobExecutor(job) {
           type: 'EXECUTE_JOB',
           job: {
             id: job.id,
-            prompt: job.prompt,
-            reference_files: job.reference_files,
+            prompt: job.prompt,                    // already modified if user edited
+            reference_files: job.reference_files,  // already modified
             watermark_removal: job.watermark_removal,
+            _original: {
+              prompt: job._originalPrompt,
+              reference_files: job._originalRefs,
+            },
+            _modified: {
+              prompt: job._modifiedPrompt,
+              reference_files: job._modifiedRefs,
+            },
           },
         });
         break;
@@ -528,9 +562,13 @@ function onJobComplete(shotId, result) {
       type: 'ASSET_SAVED',
       shotId,
       paths: result.paths || [],
-      base64Data: result.base64Data
+      base64Data: result.base64Data,
+      originalPrompt: job ? job._originalPrompt : null,
+      modifiedPrompt: job ? job._modifiedPrompt : null,
+      originalRefs: job ? job._originalRefs : null,
+      modifiedRefs: job ? job._modifiedRefs : null,
     });
-  
+
   } else {
     updateJobStatus(shotId, 'failed');
     sendWs({ type: 'JOB_FAILED', shotId, error: result.error || 'Unknown error' });
@@ -769,6 +807,197 @@ function stopRunAll() {
 }
 
 stopBtn.addEventListener('click', stopRunAll);
+
+// ── Prompt Editor Modal ─────────────────────────────────────────────────────
+
+let editorCurrentJobId = null;
+
+function openPromptEditor(jobId) {
+  const job = queuedJobs.find(j => j.id === jobId);
+  if (!job) return;
+
+  editorCurrentJobId = jobId;
+
+  // Populate title
+  document.getElementById('editor-title').textContent = `Edit Task: ${job.id}`;
+
+  // Populate original (read-only)
+  const origEl = document.getElementById('editor-original');
+  const origPrompt = job._originalPrompt || job.prompt;
+  origEl.textContent = origPrompt;
+  // Highlight if modified
+  if (job._modifiedPrompt !== null) {
+    origEl.classList.add('modified');
+  } else {
+    origEl.classList.remove('modified');
+  }
+
+  // Populate textarea (use modified if set, otherwise original)
+  const textarea = document.getElementById('editor-textarea');
+  textarea.value = job._modifiedPrompt !== null ? job._modifiedPrompt : job.prompt;
+
+  // Populate attachments (use modified if set, otherwise original)
+  renderEditorAttachments(job._modifiedRefs !== null ? job._modifiedRefs : job.reference_files);
+
+  // Show modal
+  document.getElementById('editor-overlay').classList.add('open');
+
+  // Focus textarea
+  setTimeout(() => {
+    textarea.focus();
+    // Place cursor at end
+    const len = textarea.value.length;
+    textarea.setSelectionRange(len, len);
+  }, 50);
+
+  // Prevent dialog from interfering with outside clicks
+  event && event.stopPropagation && event.stopPropagation();
+}
+
+function closePromptEditor() {
+  editorCurrentJobId = null;
+  document.getElementById('editor-overlay').classList.remove('open');
+}
+
+function renderEditorAttachments(refs) {
+  const container = document.getElementById('editor-attachments');
+  container.innerHTML = '';
+
+  if (!refs || refs.length === 0) {
+    const empty = document.createElement('span');
+    empty.className = 'editor-att-empty';
+    empty.textContent = 'No attachments. Drag images here or click "+ Add"';
+    container.appendChild(empty);
+    return;
+  }
+
+  refs.forEach((ref, idx) => {
+    const item = document.createElement('div');
+    item.className = 'editor-att-item';
+
+    const name = document.createElement('span');
+    name.className = 'editor-att-name';
+    name.title = ref;
+    name.textContent = ref.split('/').pop();
+
+    const remove = document.createElement('button');
+    remove.className = 'editor-att-remove';
+    remove.textContent = '✕';
+    remove.title = 'Remove attachment';
+    remove.addEventListener('click', () => {
+      const updated = refs.slice();
+      updated.splice(idx, 1);
+      renderEditorAttachments(updated);
+    });
+
+    item.appendChild(name);
+    item.appendChild(remove);
+    container.appendChild(item);
+  });
+
+  // Add "+ Add" button at the end
+  const addBtn = document.createElement('button');
+  addBtn.className = 'editor-att-new';
+  addBtn.textContent = '+ Add file path';
+  addBtn.addEventListener('click', () => {
+    const path = prompt('Enter absolute image path:');
+    if (path && path.trim()) {
+      const updated = refs.slice();
+      updated.push(path.trim());
+      renderEditorAttachments(updated);
+    }
+  });
+  container.appendChild(addBtn);
+}
+
+function getEditorAttachments() {
+  const container = document.getElementById('editor-attachments');
+  const items = container.querySelectorAll('.editor-att-item .editor-att-name');
+  return Array.from(items).map(el => el.title);
+}
+
+function saveAndSendFromEditor() {
+  if (!editorCurrentJobId) return;
+  const job = queuedJobs.find(j => j.id === editorCurrentJobId);
+  if (!job) return;
+
+  const newPrompt = document.getElementById('editor-textarea').value.trim();
+  const newRefs = getEditorAttachments();
+
+  // Detect modification
+  const originalPrompt = job._originalPrompt || job.prompt;
+  const originalRefs = job._originalRefs || job.reference_files;
+
+  const promptChanged = newPrompt !== originalPrompt;
+  const refsChanged = JSON.stringify(newRefs) !== JSON.stringify(originalRefs);
+
+  if (promptChanged || refsChanged) {
+    job._modifiedPrompt = newPrompt;
+    job._modifiedRefs = newRefs;
+    // Apply modification to live fields
+    job.prompt = newPrompt;
+    job.reference_files = newRefs;
+    remoteLog(`Task ${job.id} marked MODIFIED (prompt: ${promptChanged}, refs: ${refsChanged})`);
+  } else {
+    // Reverted to original — clear modification flags
+    job._modifiedPrompt = null;
+    job._modifiedRefs = null;
+    job.prompt = originalPrompt;
+    job.reference_files = originalRefs;
+    remoteLog(`Task ${job.id} reverted to original`);
+  }
+
+  closePromptEditor();
+  renderJobs();
+
+  // Trigger execution
+  runJobExecutor(job);
+}
+
+// Drag-and-drop attachments into the editor
+document.addEventListener('DOMContentLoaded', () => {
+  const attContainer = document.getElementById('editor-attachments');
+  if (attContainer) {
+    attContainer.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      attContainer.classList.add('drag-over');
+    });
+    attContainer.addEventListener('dragleave', () => {
+      attContainer.classList.remove('drag-over');
+    });
+    attContainer.addEventListener('drop', (e) => {
+      e.preventDefault();
+      attContainer.classList.remove('drag-over');
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+
+      // For dropped files, we need absolute paths. We can't read f.path on modern browsers.
+      // User must use the + Add button or paste path. Just show alert.
+      alert('Browser security prevents reading dropped file paths. Use "+ Add file path" instead.');
+    });
+  }
+
+  // Close handlers
+  document.getElementById('editor-close').addEventListener('click', closePromptEditor);
+  document.getElementById('editor-cancel').addEventListener('click', closePromptEditor);
+  document.getElementById('editor-send').addEventListener('click', saveAndSendFromEditor);
+
+  // Click overlay backdrop to close
+  document.getElementById('editor-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'editor-overlay') closePromptEditor();
+  });
+
+  // ESC + Ctrl/⌘+Enter
+  document.getElementById('editor-textarea').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closePromptEditor();
+    } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      saveAndSendFromEditor();
+    }
+  });
+});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 

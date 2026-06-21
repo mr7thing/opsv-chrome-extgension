@@ -154,13 +154,35 @@ function handleWsMessage(ws, data) {
     const shotId = data.shotId;
     const paths = data.paths || [];
     const base64Data = data.base64Data;
+    // Modification tracking — forwarded verbatim to opsv CLI for iterate logic
+    const originalPrompt = data.originalPrompt || null;
+    const modifiedPrompt = data.modifiedPrompt || null;
+    const originalRefs = data.originalRefs || null;
+    const modifiedRefs = data.modifiedRefs || null;
     console.log(`Job ${shotId} completed, handling asset saving...`);
 
     if (base64Data) {
+      // Robust base64 extraction: handle both raw and data URL formats
+      let base64Raw;
+      if (base64Data.includes(',')) {
+        base64Raw = base64Data.split(',').pop();
+      } else {
+        base64Raw = base64Data;
+      }
+
+      if (!base64Raw || base64Raw === 'undefined') {
+        console.error(`Invalid base64 data for ${shotId}, skipping save.`);
+        sendToIpcClient(shotId, {
+          type: 'task_result',
+          status: 'failed',
+          error: 'Invalid base64 data from extension',
+        });
+        return;
+      }
+
       const taskDir = findTaskDir(shotId, WORKSPACE_ROOT);
       if (taskDir) {
         try {
-          const base64Raw = base64Data.split(',')[1];
           const tempFileName = `generated_temp_${shotId}.png`;
           const savePath = path.join(taskDir, tempFileName);
           fs.writeFileSync(savePath, Buffer.from(base64Raw, 'base64'));
@@ -169,11 +191,15 @@ function handleWsMessage(ws, data) {
           let safePath = savePath.replace(/\\/g, '/');
           // Use query param to avoid double-slash normalization issues
           const localHttpUrl = `http://127.0.0.1:9700/files?path=${encodeURIComponent(safePath)}`;
-          
+
           sendToIpcClient(shotId, {
             type: 'task_result',
             status: 'completed',
-            imageUrl: localHttpUrl
+            imageUrl: localHttpUrl,
+            originalPrompt,
+            modifiedPrompt,
+            originalRefs,
+            modifiedRefs,
           });
 
           broadcast({
@@ -217,20 +243,47 @@ function handleWsMessage(ws, data) {
     const shotId = data.shotId;
     const fileName = data.fileName;
     const dataUrl = data.dataUrl;
+    const originalPrompt = data.originalPrompt || null;
+    const modifiedPrompt = data.modifiedPrompt || null;
+    const originalRefs = data.originalRefs || null;
+    const modifiedRefs = data.modifiedRefs || null;
 
     const taskDir = findTaskDir(shotId, WORKSPACE_ROOT);
     if (taskDir) {
       const ext = path.extname(fileName).toLowerCase() || '.png';
       const savePath = getNextIncrementalPath(taskDir, shotId, ext);
-      
-      const base64Data = dataUrl.split(',')[1];
-      fs.writeFileSync(savePath, Buffer.from(base64Data, 'base64'));
+
+      // Robust base64 extraction
+      let base64Raw;
+      if (dataUrl && dataUrl.includes(',')) {
+        base64Raw = dataUrl.split(',').pop();
+      } else {
+        base64Raw = dataUrl;
+      }
+
+      if (!base64Raw || base64Raw === 'undefined') {
+        console.error(`Invalid dataUrl for incremental ${shotId}`);
+        return;
+      }
+
+      fs.writeFileSync(savePath, Buffer.from(base64Raw, 'base64'));
       console.log(`Saved incremental result (renamed): ${savePath}`);
-      
+
       broadcast({
         type: 'INCREMENTAL_SAVED',
         shotId: shotId,
         path: savePath
+      });
+
+      // Notify the original IPC caller if any (manual drop happens when CLI is waiting)
+      sendToIpcClient(shotId, {
+        type: 'incremental_result',
+        status: 'completed',
+        path: savePath,
+        originalPrompt,
+        modifiedPrompt,
+        originalRefs,
+        modifiedRefs,
       });
     } else {
       console.error(`Could not locate task directory for ${shotId} to save incremental result.`);
