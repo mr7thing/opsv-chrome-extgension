@@ -8,6 +8,7 @@ const { WebSocketServer } = require('ws');
 // Global State
 const wsClients = new Set();
 const ipcClients = new Map(); // shotId -> net.Socket
+let currentQueueDir = null; // Set by sync/generate IPC; used to resolve relative ref paths
 
 const WORKSPACE_ROOT = path.resolve(__dirname, '..');
 
@@ -75,16 +76,29 @@ const httpServer = http.createServer((req, res) => {
     if (parsedUrl.searchParams.has('path')) {
       filePath = parsedUrl.searchParams.get('path');
     } else {
-      const rawPath = reqUrl.substring('/files/'.length);
+      let rawPath = reqUrl.substring('/files/'.length);
+      // Strip query string if present (e.g. /files/foo.png?v=1)
+      const qIdx = rawPath.indexOf('?');
+      if (qIdx >= 0) rawPath = rawPath.substring(0, qIdx);
+      // Collapse double slashes
+      rawPath = rawPath.replace(/\/+/g, '/');
       filePath = decodeURIComponent(rawPath);
     }
-    
+
     // Normalize Windows path: strip leading slash if drive letter
     if (filePath.startsWith('/') && filePath.length > 2 && filePath[2] === ':') {
       filePath = filePath.substring(1);
     }
-    
-    const absPath = path.resolve(filePath);
+
+    // Resolve: absolute paths go straight, relative paths anchor at queueDir
+    let absPath;
+    if (path.isAbsolute(filePath)) {
+      absPath = filePath;
+    } else if (currentQueueDir) {
+      absPath = path.resolve(currentQueueDir, filePath);
+    } else {
+      absPath = path.resolve(filePath);
+    }
 
     if (!fs.existsSync(absPath) || fs.statSync(absPath).isDirectory()) {
       res.writeHead(404);
@@ -409,6 +423,8 @@ function handleIpcCommand(socket, cmd) {
   } else if (ctype === 'sync') {
     const jobs = cmd.jobs || [];
     console.log(`[IPC Server]: Received sync with ${jobs.length} task(s)`);
+    if (cmd.queueDir) currentQueueDir = cmd.queueDir;
+    else if (jobs[0]?.queueDir) currentQueueDir = jobs[0].queueDir;
 
     // ACK immediately
     socket.write(JSON.stringify({
@@ -422,9 +438,9 @@ function handleIpcCommand(socket, cmd) {
     broadcast({
       type: 'SYNC_QUEUE',
       jobs: jobs.map(j => ({
-        id: j.shotId,
+        id: j.id || j.shotId,
         prompt: j.prompt || '',
-        reference_files: j.referenceFiles || [],
+        reference_files: j.refs || j.referenceFiles || [],
         watermark_removal: j.watermarkRemoval !== false
       }))
     });

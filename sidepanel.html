@@ -190,6 +190,26 @@
     .btn-stop:hover {
       background: #d32f2f;
     }
+    .btn-secondary {
+      padding: 5px 10px;
+      background: #3a3a3a;
+      color: #ccc;
+      border: 1px solid #555;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      margin-left: 6px;
+    }
+    .btn-secondary:hover {
+      background: #555;
+      color: #fff;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
     .btn-action {
       background: transparent;
       border: 1px solid #555;
@@ -515,7 +535,7 @@
 </head>
 <body>
   <div class="header">
-    <h3>OpsV Queue <span style="font-size:10px;color:#888;">v0.5.4</span></h3>
+    <h3>OpsV Queue <span id="version-label" style="font-size:10px;color:#888;">v0.5.6</span></h3>
     <div class="status-row">
       <span id="mode-label" style="font-size:10px;color:#888;">AUTO</span>
       <div id="status-indicator" class="status disconnected" title="Disconnected"></div>
@@ -531,6 +551,8 @@
     <label class="chk-label">
       <input type="checkbox" id="remove-watermark-cb" checked> Remove watermark
     </label>
+    <button id="clear-all-btn" class="btn-secondary" title="Clear all tasks from queue">🗑 Clear</button>
+    <button id="clear-done-btn" class="btn-secondary" title="Remove completed/failed tasks">Clear Done</button>
   </div>
 
   <div id="job-list" class="job-list">

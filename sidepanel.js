@@ -125,15 +125,18 @@ function handleMsg(msg) {
       addJob(msg.job);
       break;
     case 'SYNC_QUEUE':
-      // opsv CLI sent a fresh batch — replace entire queue
-      queuedJobs = (msg.jobs || []).map(j => ({
+      // opsv CLI sent a fresh batch — replace entire queue.
+      // If a job id already exists, reset its status to 'pending' (it'll be retried).
+      const incomingIds = new Set((msg.jobs || []).map(j => j.id).filter(Boolean));
+      queuedJobs = queuedJobs.filter(j => !incomingIds.has(j.id)); // drop dupes
+      queuedJobs = queuedJobs.concat((msg.jobs || []).map(j => ({
         id: j.id,
         prompt: j.prompt || '',
         reference_files: j.reference_files || [],
         watermark_removal: j.watermark_removal !== false,
         status: 'pending',
         result_files: []
-      }));
+      })));
       renderJobs();
       if (isAutoMode && !isRunning) runNextJob();
       break;
@@ -291,6 +294,7 @@ function renderJobs() {
           <button class="btn-action-sm btn-inject" data-job-id="${job.id}" title="一键注入图片和文字（不发送）">⚡ Inject</button>
           ${job.status === 'failed' || job.status === 'done' ? `<button class="btn-action-sm btn-retry" data-job-id="${job.id}">🔄 Retry</button>` : ''}
           ${job.status === 'pending' ? `<button class="btn-action-sm btn-run" data-job-id="${job.id}">▶ Run</button>` : ''}
+          <button class="btn-action-sm btn-remove" data-job-id="${job.id}" title="从队列删除">✕</button>
         </div>
       </div>`;
 
@@ -371,6 +375,19 @@ function renderJobs() {
           renderJobs();
           runJobExecutor(targetJob);
         }
+      });
+    }
+
+    const removeBtn = div.querySelector('.btn-remove');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (job.status === 'running') {
+          alert('Cannot remove a running job. Stop it first.');
+          return;
+        }
+        queuedJobs = queuedJobs.filter(j => j.id !== job.id);
+        renderJobs();
       });
     }
 
@@ -676,6 +693,33 @@ modeAutoBtn.addEventListener('click', () => {
 modeManualBtn.addEventListener('click', () => {
   switchToManualMode();
 });
+
+// Clear buttons
+const clearAllBtn = document.getElementById('clear-all-btn');
+const clearDoneBtn = document.getElementById('clear-done-btn');
+
+if (clearAllBtn) {
+  clearAllBtn.addEventListener('click', () => {
+    if (isRunning) {
+      alert('Cannot clear while a job is running. Stop it first.');
+      return;
+    }
+    if (!confirm(`Clear all ${queuedJobs.length} task(s) from queue?`)) return;
+    queuedJobs = [];
+    renderJobs();
+    remoteLog('Queue cleared by user');
+  });
+}
+
+if (clearDoneBtn) {
+  clearDoneBtn.addEventListener('click', () => {
+    const before = queuedJobs.length;
+    queuedJobs = queuedJobs.filter(j => j.status !== 'completed' && j.status !== 'failed');
+    const removed = before - queuedJobs.length;
+    renderJobs();
+    remoteLog(`Cleared ${removed} done/failed task(s)`);
+  });
+}
 
 // ── Manual Injections ──────────────────────────────────────────────────────────
 
