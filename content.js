@@ -217,9 +217,20 @@
         return true;
       }
 
-      // Step 4: Fallback to clipboard paste
+      // Step 4: Fallback to clipboard paste (v0.4 working approach)
       remoteLog('Drag-drop failed, trying clipboard paste...');
-      return await uploadViaClipboardFallback([fileUrl]);
+      await copyImageToClipboard(blob);
+      const composer2 = findComposer();
+      if (composer2) {
+        focusComposer(composer2);
+        await sleep(500);
+        await pasteIntoComposer(composer2);
+        await waitForUploadPreview(blob);
+        remoteLog('Clipboard upload preview confirmed');
+        return true;
+      }
+      remoteLog('Clipboard paste fallback also failed');
+      return false;
     } catch (err) {
       remoteLog('uploadReferenceImage error:', err.message);
       return false;
@@ -323,7 +334,25 @@
       remoteLog(`Composite image: ${compositeBlob.size} bytes`);
 
       // Step 3: Upload the single composite via drag-drop
-      return await uploadViaDragDrop(compositeBlob, 'composite_ref_grid.png');
+      const dragOk = await uploadViaDragDrop(compositeBlob, 'composite_ref_grid.png');
+      if (dragOk) return true;
+
+      // Fallback: upload each image via clipboard paste
+      remoteLog('Batch drag-drop failed, trying clipboard paste for each image...');
+      for (let i = 0; i < blobs.length; i++) {
+        const name = fileUrls[i] ? fileUrls[i].split('/').pop() : `ref_${i}.png`;
+        await copyImageToClipboard(blobs[i]);
+        const composerCb = findComposer();
+        if (composerCb) {
+          focusComposer(composerCb);
+          await sleep(500);
+          await pasteIntoComposer(composerCb);
+          await waitForUploadPreview(blobs[i]);
+          remoteLog(`Clipboard uploaded image ${i+1}/${blobs.length}: ${name}`);
+        }
+        await sleep(2000);
+      }
+      return true;
     } catch (err) {
       remoteLog('uploadReferenceImagesBatch error:', err.message);
       return await uploadFilesViaDragDrop(blobs, fileUrls);
