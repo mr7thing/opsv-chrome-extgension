@@ -224,7 +224,7 @@
       if (composer2) {
         focusComposer(composer2);
         await sleep(500);
-        await pasteIntoComposer(composer2);
+        await pasteIntoComposer(composer2, blob);
         await waitForUploadPreview(blob);
         remoteLog('Clipboard upload preview confirmed');
         return true;
@@ -346,7 +346,7 @@
         if (composerCb) {
           focusComposer(composerCb);
           await sleep(500);
-          await pasteIntoComposer(composerCb);
+          await pasteIntoComposer(composerCb, blobs[i]);
           await waitForUploadPreview(blobs[i]);
           remoteLog(`Clipboard uploaded image ${i+1}/${blobs.length}: ${name}`);
         }
@@ -448,12 +448,39 @@
     });
   }
 
-  async function pasteIntoComposer(composer) {
-    // Method 1: Focus and trigger Ctrl+V
+  /**
+   * Paste image into Gemini composer by constructing a ClipboardEvent
+   * with the blob data inline — no system clipboard read needed.
+   */
+  async function pasteIntoComposer(composer, blob) {
+    // Focus the composer first
     composer.focus();
     await sleep(200);
 
-    // Dispatch keydown for Ctrl+V / Cmd+V
+    // Method 1 (preferred): Dispatch ClipboardEvent with the blob data inline.
+    // This avoids needing user gesture for navigator.clipboard.read().
+    if (blob) {
+      try {
+        const dt = new DataTransfer();
+        const file = new File([blob], 'ref_image.png', { type: blob.type || 'image/png' });
+        dt.items.add(file);
+
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt,
+        });
+
+        composer.dispatchEvent(pasteEvent);
+        await sleep(800);
+        remoteLog('Inline ClipboardEvent dispatched with blob data');
+        return true;
+      } catch (err) {
+        remoteLog('Inline ClipboardEvent failed:', err.message);
+      }
+    }
+
+    // Method 2: Dispatch Ctrl+V keydown (triggers Gemini's paste handler)
     const isMac = navigator.platform.includes('Mac');
     const ctrlKey = !isMac;
     const metaKey = isMac;
@@ -463,7 +490,7 @@
       ctrlKey, metaKey, bubbles: true, cancelable: true,
     }));
 
-    // Also dispatch paste event with clipboard data for rich text editors
+    // Method 3: Attempt to read clipboard and re-dispatch (may fail without gesture)
     try {
       const clipboardItems = await navigator.clipboard.read();
       if (clipboardItems.length > 0) {
@@ -471,28 +498,20 @@
         const types = item.types;
 
         for (const type of types) {
-          const blob = await item.getType(type);
-          const pasteEvent = new ClipboardEvent('paste', {
-            bubbles: true,
-            cancelable: true,
+          const blobItem = await item.getType(type);
+          const pe = new ClipboardEvent('paste', {
+            bubbles: true, cancelable: true,
             clipboardData: new DataTransfer(),
           });
-
-          // Try to add the data to clipboardData
-          try {
-            pasteEvent.clipboardData.items.add(blob, type);
-          } catch {
-            // DataTransfer items might be read-only in some contexts
-          }
-
-          composer.dispatchEvent(pasteEvent);
+          try { pe.clipboardData.items.add(blobItem, type); } catch {}
+          composer.dispatchEvent(pe);
         }
       }
     } catch (err) {
-      remoteLog('Clipboard read in paste fallback error:', err.message);
+      remoteLog('Clipboard read fallback error:', err.message);
     }
 
-    // Method 2: document.execCommand('paste')
+    // Method 4: execCommand paste (deprecated but kept as last resort)
     try {
       document.execCommand('paste');
     } catch {}
