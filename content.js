@@ -42,9 +42,17 @@
   }
 
   // ── Constants ──────────────────────────────────────────────────────────
-  const DAEMON_FILES = 'http://127.0.0.1:9700/files/';
+  const DAEMON_HTTP = 'http://127.0.0.1:9700';
+  const DAEMON_FILES = DAEMON_HTTP + '/files';
   const GENERATION_TIMEOUT_MS = 180000;
   const IMAGE_CHECK_INTERVAL_MS = 2000;
+
+  // Build a /files URL, collapsing double slashes
+  function buildFileUrl(filePath) {
+    let p = filePath.replace(/\/+/g, '/');
+    if (!p.startsWith('/')) p = '/' + p;
+    return DAEMON_FILES + p;
+  }
 
   // ── Message Listener ───────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -192,8 +200,7 @@
     try {
       // Step 1: Fetch the image from daemon
       let safePath = fileUrl.replace(/\\\\/g, '/');
-      if (!safePath.startsWith('/')) safePath = '/' + safePath;
-      const httpUrl = DAEMON_FILES + safePath;
+      const httpUrl = buildFileUrl(safePath);
       remoteLog(`Fetching reference: ${httpUrl}`);
       const blob = await fetchImage(httpUrl);
       if (!blob) {
@@ -309,8 +316,7 @@
       const blobs = [];
       for (const fileUrl of fileUrls) {
         let safePath = fileUrl.replace(/\\\\/g, '/');
-        if (!safePath.startsWith('/')) safePath = '/' + safePath;
-        const httpUrl = DAEMON_FILES + safePath;
+        const httpUrl = buildFileUrl(safePath);
         remoteLog(`Fetching reference: ${httpUrl}`);
         const blob = await fetchImage(httpUrl);
         if (blob) {
