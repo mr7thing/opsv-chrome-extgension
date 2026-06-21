@@ -17,9 +17,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ received: true });
     return true;
   }
-  if (request.type === 'OPEN_SIDEPANEL') {
-    chrome.sidePanel.open({ windowId: sender.tab?.windowId });
-    sendResponse({ opened: true });
-    return true;
-  }
+  // OPEN_SIDEPANEL removed: chrome.sidePanel.open() requires a user gesture,
+  // and tool-bar click already opens the panel via setPanelBehavior above.
 });
