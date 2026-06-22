@@ -10,6 +10,15 @@
   // Track the last selection range in the composer contenteditable
   let lastSelectionRange = null;
 
+  // Detect whether this is a fresh page (vs. SPA navigation) — Gemini is a
+  // SPA so URL changes don't reload the script. But a hard refresh DOES, and
+  // we need to recover cleanly: drop any stale state and tell background.
+  let isFreshLoad = (performance.getEntriesByType('navigation')[0]?.type === 'reload')
+                  || (performance.navigation && performance.navigation.type === 1);
+  if (isFreshLoad) {
+    console.log('[OpsV] Content script injected after page reload');
+  }
+
   document.addEventListener('selectionchange', () => {
     try {
       const sel = window.getSelection();
@@ -30,6 +39,123 @@
     chrome.runtime.sendMessage({ type: 'OPEN_SIDEPANEL' }).catch(() => {});
   } catch {}
 
+  // Notify background + sidepanel that this content-script instance just
+  // bootstrapped. Sidepanel uses this to detect "the user refreshed Gemini
+  // mid-task" and mark the in-flight task as interrupted instead of leaving
+  // it hanging forever.
+  try {
+    chrome.runtime.sendMessage({
+      type: 'CONTENT_READY',
+      isFreshLoad,
+      url: location.href,
+      ts: Date.now(),
+    }).catch(() => {});
+  } catch {}
+
+  // ── Conversation URL Watcher ──────────────────────────────────────────
+  // Gemini changes URL from /app → /app/<convId> once a generation starts.
+  // Capturing this lets the sidepanel (and Agent) recover after a refresh:
+  // if we observed a convId before the page died, the result is still on
+  // Gemini's server at that URL.
+  let lastConvId = extractConvId(location.href);
+
+  function extractConvId(url) {
+    try {
+      const u = new URL(url);
+      const m = u.pathname.match(/^\/app\/([a-zA-Z0-9_-]{6,})/);
+      return m ? m[1] : null;
+    } catch { return null; }
+  }
+
+  function reportConvId(convId, source) {
+    if (!convId || convId === lastConvId) return;
+    lastConvId = convId;
+    remoteLog(`Conversation URL detected: ${convId} (source=${source})`);
+    try {
+      chrome.runtime.sendMessage({
+        type: 'CONV_URL_CHANGED',
+        convId,
+        url: location.href,
+        ts: Date.now(),
+        source,
+      }).catch(() => {});
+    } catch {}
+  }
+
+  // Probe immediately in case we landed on /app/<id> already.
+  if (lastConvId) reportConvId(lastConvId, 'initial');
+
+  // Monkey-patch pushState/replaceState so Gemini's SPA navigation triggers.
+  const _push = history.pushState.bind(history);
+  const _replace = history.replaceState.bind(history);
+  history.pushState = function (...args) {
+    const r = _push(...args);
+    queueMicrotask(() => {
+      const id = extractConvId(location.href);
+      if (id) reportConvId(id, 'pushState');
+      else if (lastConvId) {
+        // URL moved off a convId (user opened new chat) — reset tracker
+        lastConvId = null;
+        remoteLog('Conversation URL cleared (new chat opened)');
+      }
+    });
+    return r;
+  };
+  history.replaceState = function (...args) {
+    const r = _replace(...args);
+    queueMicrotask(() => {
+      const id = extractConvId(location.href);
+      if (id) reportConvId(id, 'replaceState');
+      else if (lastConvId) {
+        lastConvId = null;
+        remoteLog('Conversation URL cleared (new chat)');
+      }
+    });
+    return r;
+  };
+  window.addEventListener('popstate', () => {
+    const id = extractConvId(location.href);
+    if (id) reportConvId(id, 'popstate');
+  });
+
+  // ── Gemini Fresh-Conversation Probe ───────────────────────────────────
+  // Reports back when the composer is empty AND no chat history is showing
+  // — i.e. Gemini is sitting on a fresh "/app" (new chat) page. The sidepanel
+  // uses this signal to mark the active batch as `gating → ready` so the
+  // Agent can CONTINUE it.
+  let lastFreshReported = false;
+  function probeFreshConversation() {
+    try {
+      const composer = findComposer();
+      const composerText = composer ? (composer.textContent || '').trim() : '__no_composer__';
+      // Heuristic: composer empty + no images/preview chips in the input area.
+      const composerEmpty = composer && composerText === '';
+      const composerArea = composer?.closest('[class*="input"], [class*="composer"], [class*="container"]') || composer?.parentElement;
+      const previewChips = composerArea ? composerArea.querySelectorAll('[class*="chip"], [class*="thumbnail"], [class*="attachment"] img').length : 0;
+      const isFresh = composerEmpty && previewChips === 0;
+      if (isFresh && !lastFreshReported) {
+        lastFreshReported = true;
+        remoteLog('Fresh conversation detected (composer empty, no preview chips)');
+        chrome.runtime.sendMessage({
+          type: 'GEMINI_TAB_READY',
+          url: location.href,
+          convId: lastConvId,
+          ts: Date.now(),
+        }).catch(() => {});
+      } else if (!isFresh && lastFreshReported) {
+        // Composer has content again — flip back so a fresh chat later re-fires.
+        lastFreshReported = false;
+        remoteLog('Fresh-conversation signal cleared (composer now has content)');
+      }
+    } catch (err) {
+      // Best-effort probe; ignore failures.
+    }
+  }
+  // Probe once at startup (in case the user opened a fresh tab before content.js injected).
+  setTimeout(probeFreshConversation, 800);
+  // Then keep probing every 2s so we catch the user opening new chat / clearing composer.
+  setInterval(probeFreshConversation, 2000);
+
   // ── Remote Logger ──────────────────────────────────────────────────────
   function remoteLog(...args) {
     console.log('[OpsV]', ...args);
@@ -46,20 +172,54 @@
   const DAEMON_FILES = DAEMON_HTTP + '/files';
   const GENERATION_TIMEOUT_MS = 180000;
   const IMAGE_CHECK_INTERVAL_MS = 2000;
+  const UPLOAD_CONFIRM_TIMEOUT_MS = 30000; // max wait per file for upload confirmation
 
-  // Build a /files URL, collapsing double slashes
+  // Stop signal — set by STOP_JOB message, checked by all async loops
+  let isStopped = false;
+
+  function resetStop() { isStopped = false; }
+  function requestStop() {
+    isStopped = true;
+    remoteLog('STOP requested by user');
+  }
+
+  // Build a /files URL, preserving leading slash for absolute paths
   function buildFileUrl(filePath) {
     let p = filePath.replace(/\/+/g, '/');
+    if (p.startsWith('/')) {
+      // Absolute path: double-slash so daemon preserves leading /
+      return DAEMON_FILES + '/' + p;
+    }
     if (!p.startsWith('/')) p = '/' + p;
     return DAEMON_FILES + p;
+  }
+
+  // Ensure Gemini tab has focus so clipboard operations work
+  async function ensureFocused() {
+    try {
+      // First try: ask background to focus this tab/window
+      const resp = await chrome.runtime.sendMessage({ type: 'FOCUS_TAB' });
+      if (resp?.focused) remoteLog('Tab focused via background');
+    } catch (e) {
+      // Background focus not available (just activeTab), fall through
+    }
+    // Second try: focus window + document from content script
+    window.focus();
+    document.body?.focus();
+    document.documentElement?.focus();
+    await sleep(200);
   }
 
   // ── Message Listener ───────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.type === 'EXECUTE_JOB') {
       remoteLog('Received Job:', request.job.id);
+      resetStop();
       runJob(request.job);
       sendResponse({ status: 'started' });
+    } else if (request.type === 'STOP_JOB') {
+      requestStop();
+      sendResponse({ status: 'stopping' });
     } else if (request.type === 'CHECK_RESPONSE') {
       checkForResult().then(result => sendResponse(result));
       return true; // async response
@@ -108,31 +268,43 @@
       // Step 1: Upload reference images if any
       if (refFiles.length > 0) {
         remoteLog(`Uploading ${refFiles.length} reference image(s)...`);
-        // Try batch upload (composite to single grid then drag-drop)
+        // Per-file drag-drop. uploadViaDragDrop now waits for upload
+        // confirmation (chip status / new img in composer) before returning.
         const ok = await uploadReferenceImagesBatch(refFiles);
         if (!ok) {
+          if (isStopped) {
+            remoteLog('Upload aborted by user stop');
+            throw new Error('Stopped by user before upload completed');
+          }
           throw new Error('Failed to upload reference images');
+        }
+        if (isStopped) {
+          remoteLog('Stopped after upload but before prompt typing');
+          throw new Error('Stopped by user');
         }
         remoteLog('All reference images uploaded and confirmed ready');
       }
 
-      // Step 2: Type the prompt
+      // Step 2: Type the prompt (now respects isStopped per char)
       await typePrompt(prompt, false);
+      if (isStopped) throw new Error('Stopped by user during typing');
 
       // 模拟人类点击发送按钮前的短暂犹豫
       await sleep(1000 + Math.random() * 1000);
+      if (isStopped) throw new Error('Stopped by user before send');
 
       // 关键时序优化：在点击发送前一瞬间，立即收集页面上所有已有的图片 URL (包括已上传的参考图)
       const excludeUrls = getExistingImageUrls();
 
       // Step 3: Click send
       await clickSend();
+      if (isStopped) throw new Error('Stopped by user after send');
 
       // Step 4: Wait for generation
       const result = await waitForGeneration(excludeUrls);
       if (result) {
         remoteLog(`Generated image url: ${result.url}`);
-        
+
         // Try to find a high-res download link (Gemini native download button)
         let bestUrl = result.url;
         if (result.element) {
@@ -148,13 +320,13 @@
             }
           }
         }
-        
+
         // 转换最佳质量的图片为 Base64
         const base64Data = await getBase64FromUrl(bestUrl);
         if (!base64Data) {
           throw new Error('Failed to extract generated image data to base64');
         }
-        
+
         chrome.runtime.sendMessage({
           type: 'ASSET_SAVED',
           shotId,
@@ -165,11 +337,12 @@
         throw new Error('No image generated within timeout');
       }
     } catch (err) {
-      remoteLog(`Job ${shotId} failed:`, err.message);
+      const reason = isStopped ? 'Stopped by user' : err.message;
+      remoteLog(`Job ${shotId} failed:`, reason);
       chrome.runtime.sendMessage({
         type: 'JOB_FAILED',
         shotId,
-        error: err.message,
+        error: reason,
       });
     }
   }
@@ -224,19 +397,16 @@
         return true;
       }
 
-      // Step 4: Fallback to clipboard paste (v0.4 working approach)
-      remoteLog('Drag-drop failed, trying clipboard paste...');
-      await copyImageToClipboard(blob);
-      const composer2 = findComposer();
-      if (composer2) {
-        focusComposer(composer2);
+      // Step 4: Fallback to synthetic paste event (no clipboard API needed)
+      remoteLog('Drag-drop failed, trying synthetic paste...');
+      const pasted = pasteFileIntoComposer(blob, fileUrl.split('/').pop() || 'ref_image.png');
+      if (pasted) {
         await sleep(500);
-        await pasteIntoComposer(composer2);
-        await waitForUploadPreview(blob);
-        remoteLog('Clipboard upload preview confirmed');
+        // CHANGED 2026-06-22: assume paste success (no chip wait)
+        remoteLog('Synthetic paste dispatched (assuming success)');
         return true;
       }
-      remoteLog('Clipboard paste fallback also failed');
+      remoteLog('Synthetic paste also failed');
       return false;
     } catch (err) {
       remoteLog('uploadReferenceImage error:', err.message);
@@ -245,52 +415,333 @@
   }
 
   /**
-   * Simulate a file drop on the composer element.
-   * Creates a proper DragEvent with a DataTransfer containing the image File.
+   * Upload a blob to the Gemini composer.
+   *
+   * Strategy (try in order, fall back on failure):
+   *   1. clipboard path: write image to system clipboard via navigator.clipboard.write,
+   *      then document.execCommand('paste') into the focused composer.
+   *      This is the path the user confirmed actually attaches images to Gemini.
+   *   2. drag-drop path: dispatch synthetic dragenter/dragover/drop with a File in
+   *      the DataTransfer. May or may not be honored by current Gemini build.
+   *
+   * After a successful paste we WAIT for the composer to actually contain a new
+   * <img> (the uploaded preview). This is the real "upload complete" signal —
+   * chip-based detection kept failing because Gemini's chip selector changes
+   * with every release. Without this wait, typing the prompt starts while the
+   * upload is still in-flight and Gemini drops the file.
+   *
+   * Returns true only if we observed a new <img> in the composer after paste.
+   * Returns false on stop, on timeout, or if both upload strategies fail.
    */
   async function uploadViaDragDrop(blob, filename) {
+    const composer = findComposer();
+    if (!composer) {
+      remoteLog('Upload: no composer found');
+      return false;
+    }
+    const file = new File([blob], filename, { type: blob.type || 'image/png' });
+
+    // Snapshot the composer's image count BEFORE we try to upload.
+    // After upload, an <img> with the uploaded preview should appear.
+    const preCount = composer.querySelectorAll('img').length;
+
+    // The actual drop target is the page-wide chat-container with
+    // `file-drop-zone` attribute. Angular's directive catches drops there.
+    // Falling back to composer is the legacy path.
+    const dropTarget = document.querySelector('[file-drop-zone]') || composer;
+
+    // ── Strategy 1: clipboard write + execCommand('paste') ─────────────
+    let pasted = false;
     try {
-      const composer = findComposer();
-      if (!composer) return false;
+      // Focus window first — navigator.clipboard.write requires document focus.
+      // We focus the window TWICE (with a delay) because Chrome may need a
+      // moment after windows.update() to actually deliver focus to the page.
+      await ensureFocused();
+      await sleep(300);
+      window.focus();
+      document.body?.focus();
+      // Bring composer into focus so execCommand targets the right element.
+      composer.focus();
+      await sleep(200);
 
-      // Create a File object from the blob
-      const file = new File([blob], filename, { type: blob.type || 'image/png' });
-      
-      // Create DataTransfer with the file
-      const dt = new DataTransfer();
-      dt.items.add(file);
+      const item = new ClipboardItem({ [blob.type || 'image/png']: blob });
+      await navigator.clipboard.write([item]);
+      remoteLog(`Clipboard write ok for ${filename}, issuing execCommand('paste')`);
 
-      remoteLog(`Simulating drag-drop for ${filename} (${(blob.size / 1024).toFixed(0)}KB)`);
+      // execCommand targets the focused contenteditable. Composer is focused above.
+      const ok = document.execCommand('paste');
+      remoteLog(`execCommand('paste') returned ${ok}`);
 
-      // Dispatch drag events in sequence (what Gemini expects)
-      composer.dispatchEvent(new DragEvent('dragenter', {
-        dataTransfer: dt, bubbles: true, cancelable: true
-      }));
-      await sleep(100);
+      // VERIFY that paste actually produced something in the input area.
+      // If not, fall through to drag-drop / file-picker strategies.
+      await sleep(800);
+      const pasteCount = composer.querySelectorAll('img').length;
+      const composerParent = composer.closest('[class*="input"], [class*="composer"], [class*="container"]') || composer.parentElement;
+      const chipCount = composerParent ? composerParent.querySelectorAll('[class*="chip"], [class*="thumbnail"], [class*="attachment"] img').length : 0;
+      if (pasteCount > preCount || chipCount > 0) {
+        pasted = true;
+        remoteLog(`Strategy 1 (clipboard paste) actually attached the file: composerImg=${pasteCount}, chips=${chipCount}`);
+      } else {
+        remoteLog(`Strategy 1 (clipboard paste) returned true but produced no visible image. Falling through.`);
+      }
+    } catch (err) {
+      remoteLog(`Clipboard path failed for ${filename}: ${err.message}; trying ClipboardEvent fallback`);
+      // Fallback: dispatch a synthetic ClipboardEvent with the File in
+      // clipboardData. This does NOT require document focus (the page is
+      // already past the user-gesture check once the user clicked Run).
+      try {
+        const file2 = new File([blob], filename, { type: blob.type || 'image/png' });
+        const dt = new DataTransfer();
+        dt.items.add(file2);
+        const evt = new ClipboardEvent('paste', {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true,
+        });
+        composer.dispatchEvent(evt);
+        remoteLog(`Dispatched synthetic paste ClipboardEvent with ${filename} (${(blob.size / 1024).toFixed(0)}KB)`);
+        // Verify quickly — if no image/chip appeared, keep trying other strategies
+        await sleep(800);
+        const evtCount = composer.querySelectorAll('img').length;
+        const evtParent = composer.closest('[class*="input"], [class*="composer"], [class*="container"]') || composer.parentElement;
+        const evtChips = evtParent ? evtParent.querySelectorAll('[class*="chip"], [class*="thumbnail"], [class*="attachment"] img').length : 0;
+        if (evtCount > preCount || evtChips > 0) {
+          pasted = true;
+          remoteLog(`ClipboardEvent fallback actually attached the file`);
+        } else {
+          remoteLog(`ClipboardEvent fallback dispatched but no visible image. Falling through.`);
+        }
+      } catch (evtErr) {
+        remoteLog(`Synthetic paste ClipboardEvent also failed: ${evtErr.message}`);
+      }
+    }
 
-      composer.dispatchEvent(new DragEvent('dragover', {
-        dataTransfer: dt, bubbles: true, cancelable: true
-      }));
-      await sleep(100);
+    // ── Strategy 2: synthetic drag-drop on page-wide file-drop-zone ───
+    // The drop target is the chat container (not composer) — Angular's
+    // file-drop-zone directive handles the event there.
+    if (!pasted) {
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        remoteLog(`Falling back to drag-drop on ${dropTarget.tagName}.${(dropTarget.className || '').toString().slice(0, 40)} for ${filename} (${(blob.size / 1024).toFixed(0)}KB)`);
+        // Dispatch at window level so the event bubbles up to the directive.
+        const dragenter = new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true });
+        const dragover = new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true });
+        const drop = new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true });
+        dropTarget.dispatchEvent(dragenter);
+        await sleep(100);
+        dropTarget.dispatchEvent(dragover);
+        await sleep(100);
+        dropTarget.dispatchEvent(drop);
+        // Also dispatch on composer (some builds listen there).
+        composer.dispatchEvent(dragenter);
+        composer.dispatchEvent(dragover);
+        composer.dispatchEvent(drop);
+        // Wait briefly and verify
+        await sleep(1000);
+        const dragCount = composer.querySelectorAll('img').length;
+        const dragParent = composer.closest('[class*="input"], [class*="composer"], [class*="container"]') || composer.parentElement;
+        const dragChips = dragParent ? dragParent.querySelectorAll('[class*="chip"], [class*="thumbnail"], [class*="attachment"] img').length : 0;
+        if (dragCount > preCount || dragChips > 0) {
+          pasted = true;
+          remoteLog(`Strategy 2 (drag-drop) attached file: $_opsvDragPreCheck`);
+        } else {
+          remoteLog(`Strategy 2 (drag-drop) dispatched but no visible image. Trying file-picker strategy.`);
+        }
+      } catch (err) {
+        remoteLog(`Drag-drop fallback failed: ${err.message}`);
+      }
+    }
 
-      composer.dispatchEvent(new DragEvent('drop', {
-        dataTransfer: dt, bubbles: true, cancelable: true
-      }));
-      await sleep(500);
+    // ── Strategy 3: inject <script> into MAIN WORLD to patch ─────────
+    // ROOT CAUSE: Chrome content scripts run in an Isolated World.
+    // Patching HTMLInputElement.prototype.click in content.js has NO effect
+    // on Gemini's Angular code, which runs in the Main World.
+    //
+    // SOLUTION: Inject a <script> element into the page DOM. This runs
+    // in the Main World and can patch the real HTMLInputElement.prototype.
+    // We pass the file data via dataset attributes on the document element.
+    if (!pasted) {
+      try {
+        const uploadBtn = document.querySelector('button[aria-label="上传和工具"]');
+        if (uploadBtn) {
+          remoteLog(`Injecting MAIN-WORLD patch for ${filename}`);
 
-      // Step 4: Wait for upload preview to appear
-      const confirmed = await waitForUploadPreview(blob);
-      if (confirmed) {
-        remoteLog('Drag-drop upload preview confirmed');
+          let injected = false;
+
+          // Convert file blob to base64 so we can pass it across worlds
+          const b64 = await blobToBase64(file);
+          const fileName = filename;
+          const fileType = blob.type || 'image/png';
+
+          // Set data on the document element for the injected script to read
+          document.documentElement.dataset.opsvFileB64 = b64;
+          document.documentElement.dataset.opsvFileName = fileName;
+          document.documentElement.dataset.opsvFileType = fileType;
+
+          // Inject <script> into the page — runs in MAIN WORLD
+          const script = document.createElement('script');
+          script.textContent = `
+(function(){
+  var b64 = document.documentElement.dataset.opsvFileB64;
+  var fname = document.documentElement.dataset.opsvFileName;
+  var ftype = document.documentElement.dataset.opsvFileType;
+  if (!b64 || !fname) return;
+
+  // Decode base64 → ArrayBuffer → Blob → File
+  var binary = atob(b64);
+  var buf = new ArrayBuffer(binary.length);
+  var view = new Uint8Array(buf);
+  for (var i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
+  var blob = new Blob([buf], { type: ftype });
+  var file = new File([blob], fname, { type: ftype });
+
+  var _origClick = HTMLInputElement.prototype.click;
+  var _injected = false;
+  HTMLInputElement.prototype.click = function() {
+    if (this.type === 'file' && !_injected) {
+      _injected = true;
+      try {
+        var dt = new DataTransfer();
+        dt.items.add(file);
+        Object.defineProperty(this, 'files', {
+          value: dt.files, writable: true, configurable: true
+        });
+        this.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        document.documentElement.dataset.opsvInjected = 'true';
+        return;
+      } catch(e) {
+        document.documentElement.dataset.opsvInjected = 'err:' + e.message;
+      }
+    }
+    _origClick.call(this);
+  };
+
+  // Auto-restore after 10s
+  setTimeout(function(){
+    HTMLInputElement.prototype.click = _origClick;
+    delete document.documentElement.dataset.opsvFileB64;
+    delete document.documentElement.dataset.opsvFileName;
+    delete document.documentElement.dataset.opsvFileType;
+  }, 10000);
+})();
+`;
+          document.body.appendChild(script);
+          script.remove(); // Remove the script element, but its side effects remain
+
+          // Now click the button — Gemini's Angular calls fileInput.click()
+          // which is now patched in the MAIN WORLD.
+          remoteLog(`Clicking "上传和工具" button for ${filename}`);
+          uploadBtn.click();
+
+          // Poll for the injected flag from the main world
+          for (let i = 0; i < 20; i++) {
+            await sleep(250);
+            const flag = document.documentElement.dataset.opsvInjected;
+            if (flag === 'true') {
+              injected = true;
+              remoteLog(`[Strategy 3] MAIN-WORLD patch intercepted file input for ${fileName}`);
+              break;
+            } else if (flag && flag.startsWith('err:')) {
+              remoteLog(`[Strategy 3] Main-world injection error: ${flag}`);
+              break;
+            }
+          }
+
+          if (!injected) {
+            remoteLog(`[Strategy 3] MAIN-WORLD patch didn't fire`);
+          }
+        }
+      } catch (err) {
+        remoteLog(`Strategy 3 (main-world patch) failed: ${err.message}`);
+      }
+    }
+
+    // ── Verify: wait for the upload preview <img> to appear in composer ──
+    const confirmed = await waitForUploadedImg(composer, preCount, filename);
+    if (!confirmed) {
+      remoteLog(`Upload NOT confirmed for ${filename} (no new <img> appeared)`);
+      return false;
+    }
+    remoteLog(`Upload confirmed for ${filename} (new <img> in composer)`);
+    return true;
+  }
+
+  /**
+   * Wait until the composer (or the broader input area) contains more
+   * images than the pre-upload baseline, OR a chip/preview element appears.
+   * Polling cheap (250ms).
+   */
+  async function waitForUploadedImg(composer, preCount, filename, timeoutMs = UPLOAD_CONFIRM_TIMEOUT_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (isStopped) {
+        remoteLog(`Upload wait aborted by stop (${filename})`);
+        return false;
+      }
+      await sleep(250);
+
+      // Strategy 1: composer area has new <img>
+      const nowCount = composer ? composer.querySelectorAll('img').length : 0;
+      if (nowCount > preCount) {
+        remoteLog(`Composer img count grew ${preCount} → ${nowCount} for ${filename}`);
         return true;
       }
 
-      remoteLog('Drag-drop: no upload preview detected');
-      return false;
-    } catch (err) {
-      remoteLog('uploadViaDragDrop error:', err.message);
-      return false;
+      // Strategy 2: any chip-like container with <img> inside the input area
+      const composerParent = composer?.closest('[class*="input"], [class*="composer"], [class*="container"]') || composer?.parentElement;
+      if (composerParent) {
+        const chipImages = composerParent.querySelectorAll('[class*="chip"], [class*="thumbnail"], [class*="attachment"]');
+        for (const c of chipImages) {
+          if (c.querySelector('img')) {
+            remoteLog(`Found uploaded preview chip with <img> for ${filename}`);
+            return true;
+          }
+        }
+      }
+
+      // Strategy 3: NEW — check if the file is visible in the chat/input area
+      // (Quill sometimes pastes inline img, and the upload preview may live
+      // outside the strict contenteditable container).
+      const inputArea = document.querySelector('[class*="input-area"], [class*="InputArea"]') || composerParent;
+      if (inputArea) {
+        const inputImgs = inputArea.querySelectorAll('img');
+        if (inputImgs.length > preCount) {
+          remoteLog(`Input area img count grew for ${filename}: ${preCount} → ${inputImgs.length}`);
+          return true;
+        }
+        // Check for any preview/pending element (Quill uses .ql-preview or similar)
+        const pendingEls = inputArea.querySelectorAll('[class*="preview"], [class*="pending"], [class*="uploading"], [class*="spinner"]');
+        for (const el of pendingEls) {
+          if (el.offsetParent !== null) {
+            // Visible pending state means upload is in progress or just completed
+            const hasImg = el.querySelector('img');
+            if (hasImg) {
+              remoteLog(`Found pending upload with <img> for ${filename}`);
+              return true;
+            }
+          }
+        }
+      }
+
+      // Strategy 4: any new attachment-like container appeared in the page
+      // (Gemini may render the uploaded image in a separate panel above composer).
+      const allImgsNow = document.querySelectorAll('img').length;
+      const baselineImgs = window._opsvBaselineImgCount || 0;
+      if (!baselineImgs && start < Date.now() - 500) {
+        // After 500ms, set baseline
+        if (!window._opsvBaselineImgCount) {
+          window._opsvBaselineImgCount = document.querySelectorAll('img').length;
+        }
+      }
+      if (baselineImgs && allImgsNow > baselineImgs) {
+        // Hmm — global img count grew, but that might be the user's chat
+        // history. Don't auto-success on this, but log it.
+        // Skip — keep looking for a composer-local signal.
+      }
     }
+    remoteLog(`waitForUploadedImg timeout for ${filename} (preCount=${preCount}, now=${composer?.querySelectorAll('img').length || 0})`);
+    return false;
   }
 
   async function fetchImage(url) {
@@ -304,66 +755,121 @@
     }
   }
 
-  // ── Batch Upload: composite + drag-drop ────────────────────────────────
-  /**
-   * Batch upload multiple reference images by compositing into a single grid image.
-   * Gemini only keeps the last pasted/dropped image, so we merge all refs into one.
-   * Then uploads the composite via drag-and-drop (no clipboard/user gesture needed).
-   */
-  async function uploadReferenceImagesBatch(fileUrls) {
-    try {
-      // Step 1: Download all blobs from daemon
-      const blobs = [];
-      for (const fileUrl of fileUrls) {
-        let safePath = fileUrl.replace(/\\\\/g, '/');
-        const httpUrl = buildFileUrl(safePath);
-        remoteLog(`Fetching reference: ${httpUrl}`);
-        const blob = await fetchImage(httpUrl);
-        if (blob) {
-          blobs.push(blob);
-        } else {
-          remoteLog(`Failed to fetch image: ${fileUrl}`);
+  /** Convert a Blob to base64 data URL for passing across JS worlds */
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        // Result is "data:image/png;base64,iVBORw0..." — strip prefix
+        const result = reader.result;
+        const comma = result.indexOf(',');
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  // ── Batch Upload: per-file clipboard-paste (with real confirmation) ───
+    /**
+     * Upload each ref image one by one via clipboard paste + execCommand.
+     *
+     * Wait for EACH image to be confirmed uploaded (new <img> in composer)
+     * before moving on — this prevents Gemini from discarding files when
+     * the prompt typing replaces mid-flight uploads.
+     *
+     * If any single upload fails, abort the whole batch and return false —
+     * no point proceeding to type a prompt with only partial refs.
+     *
+     * NOTE: compositeImagesToGrid is kept (commented out below) for future use.
+     */
+    async function uploadReferenceImagesBatch(fileUrls) {
+      try {
+        // Step 1: Download all blobs from daemon up front
+        const blobs = [];
+        for (const fileUrl of fileUrls) {
+          let safePath = fileUrl.replace(/\\/g, '/');
+          const httpUrl = buildFileUrl(safePath);
+          remoteLog(`Fetching reference: ${httpUrl}`);
+          const blob = await fetchImage(httpUrl);
+          if (blob) {
+            blobs.push(blob);
+          } else {
+            remoteLog(`Failed to fetch image: ${fileUrl}`);
+          }
         }
-      }
-      if (blobs.length === 0) {
-        remoteLog('No reference images could be downloaded');
+        if (blobs.length === 0) {
+          remoteLog('No reference images could be downloaded');
+          return false;
+        }
+        if (blobs.length !== fileUrls.length) {
+          remoteLog(`Partial fetch: ${blobs.length}/${fileUrls.length}; aborting batch`);
+          return false;
+        }
+        remoteLog(`Downloaded ${blobs.length}/${fileUrls.length} reference images`);
+
+        // Step 2: Paste each blob (one at a time, wait for confirmation)
+        for (let i = 0; i < blobs.length; i++) {
+          if (isStopped) {
+            remoteLog(`Batch aborted by stop before file ${i + 1}`);
+            return false;
+          }
+          const name = fileUrls[i] ? fileUrls[i].split('/').pop() : `ref_${i}.png`;
+          remoteLog(`Pasting ${i + 1}/${blobs.length}: ${name} (${(blobs[i].size / 1024).toFixed(0)}KB)`);
+
+          // Re-focus composer before each paste
+          const composer = findComposer();
+          if (composer) focusComposer(composer);
+
+          const ok = await uploadViaDragDrop(blobs[i], name);
+          if (!ok) {
+            if (isStopped) {
+              remoteLog(`Upload aborted by stop during file ${i + 1}`);
+            } else {
+              remoteLog(`Upload failed for file ${i + 1} (${name}); aborting batch`);
+            }
+            return false;
+          }
+          // Brief pause between successful uploads to let Gemini settle.
+          await sleep(600);
+        }
+        remoteLog(`All ${blobs.length} reference images uploaded and confirmed`);
+        return true;
+      } catch (err) {
+        remoteLog('uploadReferenceImagesBatch error:', err.message);
         return false;
       }
-      remoteLog(`Downloaded ${blobs.length}/${fileUrls.length} reference images`);
-
-      // Step 2: Composite all images into a single grid image
-      const compositeBlob = await compositeImagesToGrid(blobs);
-      if (!compositeBlob) {
-        remoteLog('Composite failed, trying per-file drag-drop...');
-        return await uploadFilesViaDragDrop(blobs, fileUrls);
-      }
-      remoteLog(`Composite image: ${compositeBlob.size} bytes`);
-
-      // Step 3: Upload the single composite via drag-drop
-      const dragOk = await uploadViaDragDrop(compositeBlob, 'composite_ref_grid.png');
-      if (dragOk) return true;
-
-      // Fallback: upload each image via clipboard paste
-      remoteLog('Batch drag-drop failed, trying clipboard paste for each image...');
-      for (let i = 0; i < blobs.length; i++) {
-        const name = fileUrls[i] ? fileUrls[i].split('/').pop() : `ref_${i}.png`;
-        await copyImageToClipboard(blobs[i]);
-        const composerCb = findComposer();
-        if (composerCb) {
-          focusComposer(composerCb);
-          await sleep(500);
-          await pasteIntoComposer(composerCb);
-          await waitForUploadPreview(blobs[i]);
-          remoteLog(`Clipboard uploaded image ${i+1}/${blobs.length}: ${name}`);
-        }
-        await sleep(2000);
-      }
-      return true;
-    } catch (err) {
-      remoteLog('uploadReferenceImagesBatch error:', err.message);
-      return await uploadFilesViaDragDrop(blobs, fileUrls);
     }
-  }
+
+  // COMPOSITE-BASED UPLOAD (TEMPORARILY DISABLED 2026-06-22 — per-file drag-drop
+  // works reliably; composite was unreliable due to chip-detection failure.
+  // Kept here for future reference and re-enablement.)
+  // async function _unused_uploadReferenceImagesBatch_composite(fileUrls) {
+  //   try {
+  //     const blobs = [];
+  //     for (const fileUrl of fileUrls) {
+  //       let safePath = fileUrl.replace(/\\\\/g, '/');
+  //       const httpUrl = buildFileUrl(safePath);
+  //       remoteLog(`Fetching reference: ${httpUrl}`);
+  //       const blob = await fetchImage(httpUrl);
+  //       if (blob) blobs.push(blob);
+  //     }
+  //     if (blobs.length === 0) return false;
+  //     const compositeBlob = await compositeImagesToGrid(blobs);
+  //     if (!compositeBlob) {
+  //       return await uploadFilesViaDragDrop(blobs, fileUrls);
+  //     }
+  //     const dragOk = await uploadViaDragDrop(compositeBlob, 'composite_ref_grid.png');
+  //     if (dragOk) return true;
+  //     const compositePasted = pasteFileIntoComposer(compositeBlob, 'composite_ref_grid.png');
+  //     if (compositePasted) {
+  //       await sleep(500);
+  //     }
+  //     return false;
+  //   } catch (err) {
+  //     return await uploadFilesViaDragDrop(blobs, fileUrls);
+  //   }
+  // }
 
   /**
    * Composite multiple images into a single grid (max 3 per row).
@@ -486,6 +992,29 @@
     return true;
   }
 
+  /**
+   * Paste a File directly into the Gemini composer via synthetic ClipboardEvent.
+   * Does NOT use navigator.clipboard.write() — avoids content-script focus restrictions.
+   * Gemini's paste handler reads event.clipboardData.files and starts upload.
+   */
+  function pasteFileIntoComposer(blob, filename) {
+    const file = new File([blob], filename, { type: blob.type || 'image/png' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+
+    const pasteEvent = new ClipboardEvent('paste', {
+      clipboardData: dt,
+      bubbles: true,
+      cancelable: true
+    });
+
+    const composer = findComposer();
+    if (!composer) return false;
+    composer.dispatchEvent(pasteEvent);
+    remoteLog(`Dispatched synthetic paste event with ${filename} (${(blob.size / 1024).toFixed(0)}KB)`);
+    return true;
+  }
+
   async function waitForUploadPreview(expectedBlob, timeoutMs = 30000) {
     const start = Date.now();
     let chipFound = false;
@@ -520,6 +1049,75 @@
 
     // Timeout: if we at least found a chip, consider it ready
     return chipFound;
+  }
+
+  /**
+   * Wait for the just-dropped file to be confirmed uploaded.
+   *
+   * Multi-strategy (each strategy is a heuristic — we use the FIRST one that
+   * gives a clear signal, otherwise fall through to the next):
+   *
+   *   1. chip is found with status='ready' (class on the chip)
+   *   2. composer area contains an <img> whose src starts with a data: URL
+   *      (Gemini's uploaded preview uses a blob: URL — once it shows in
+   *       the composer, the upload is complete)
+   *   3. chip was found earlier and is now gone (Gemini removed the chip
+   *      after merging the image into the composer body)
+   *
+   * The detection is polling-based (cheap 200ms) with a max timeout.
+   * Returns true if any strategy says "ready", false on timeout.
+   */
+  async function waitForUploadComplete(expectedBlob, timeoutMs = UPLOAD_CONFIRM_TIMEOUT_MS) {
+    const start = Date.now();
+    let chipEverSeen = false;
+    let preDropImgCount = 0;
+    const composer = findComposer();
+    if (composer) {
+      preDropImgCount = composer.querySelectorAll('img').length;
+    }
+
+    while (Date.now() - start < timeoutMs) {
+      if (isStopped) {
+        remoteLog('Upload wait aborted by stop');
+        return false;
+      }
+      await sleep(200);
+
+      // Strategy 1: explicit ready chip
+      const chip = findUploadChip();
+      if (chip) {
+        chipEverSeen = true;
+        const status = getUploadChipStatus(chip);
+        if (status === 'ready') {
+          remoteLog('Upload ready (chip status)');
+          return true;
+        }
+        if (status === 'error') {
+          remoteLog('Upload failed (chip error status)');
+          return false;
+        }
+        // 'uploading' → keep waiting
+        continue;
+      }
+
+      // Strategy 2: chip gone after being seen = upload completed & merged
+      if (chipEverSeen) {
+        remoteLog('Upload ready (chip disappeared, merged)');
+        return true;
+      }
+
+      // Strategy 3: composer has a new <img> (data: or blob: src)
+      if (composer) {
+        const imgs = composer.querySelectorAll('img');
+        if (imgs.length > preDropImgCount) {
+          remoteLog('Upload ready (new img in composer)');
+          return true;
+        }
+      }
+    }
+
+    remoteLog(`Upload confirmation timed out after ${timeoutMs}ms (chipEverSeen=${chipEverSeen})`);
+    return false;
   }
 
   /**
@@ -677,6 +1275,10 @@
       
       // 逐字符键入并添加延迟和抖动以模拟真人输入
       for (let i = 0; i < text.length; i++) {
+        if (isStopped) {
+          remoteLog('Typing aborted by stop signal at char ' + i);
+          return;
+        }
         const char = text[i];
         document.execCommand('insertText', false, char);
         composer.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));

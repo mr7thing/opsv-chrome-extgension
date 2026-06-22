@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "OpenSpec-Video Companion",
-    "version": "0.5.7",
+    "version": "0.5.13",
     "description": "Browser automation companion for OpenSpec-Video — Gemini/webapp tasks",
     "permissions": [
         "sidePanel",
@@ -35,7 +35,8 @@
                 "https://gemini.google.com/*"
             ],
             "js": [
-                "content.js"
+                "content.js",
+                "main-world-bridge.js"
             ],
             "run_at": "document_idle"
         }

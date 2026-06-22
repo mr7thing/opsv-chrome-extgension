@@ -7,8 +7,14 @@ const { WebSocketServer } = require('ws');
 
 // Global State
 const wsClients = new Set();
-const ipcClients = new Map(); // shotId -> net.Socket
+const ipcClients = new Map(); // shotId -> { socket, timeoutHandle }
 let currentQueueDir = null; // Set by sync/generate IPC; used to resolve relative ref paths
+let lastSyncPayload = null; // Replayed to sidepanel on reconnect (so refresh doesn't lose tasks)
+
+// IPC timeout — if a task doesn't report back within this window, kill the
+// waiter so the next task can be picked up. Refreshed-tab scenario needs this:
+// if content.js dies mid-task, the OPSV CLI caller is blocked forever otherwise.
+const IPC_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 
 const WORKSPACE_ROOT = path.resolve(__dirname, '..');
 
@@ -69,6 +75,58 @@ const httpServer = http.createServer((req, res) => {
   if (reqUrl === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', wsPort: 3061 }));
+  } else if (reqUrl.startsWith('/agent/cmd') && req.method === 'POST') {
+    // Agent (opsv CLI / external orchestrator) posts commands here.
+    // Body is JSON: { type: 'CONTINUE_BATCH' | 'DENY_BATCH' | 'STOP_BATCH_ACK' | ..., ... }
+    // We broadcast it to all sidepanel WS clients so they can react.
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        const cmd = JSON.parse(body);
+        const mtype = cmd.type;
+        if (!mtype) {
+          res.writeHead(400); res.end('Missing type'); return;
+        }
+        // Whitelist only Agent → sidepanel commands so a random POST can't
+        // trigger random sidepanel actions.
+        const allowed = new Set([
+          'CONTINUE_BATCH', 'DENY_BATCH', 'STOP_BATCH_ACK',
+          'NEW_JOB', 'SYNC_QUEUE', 'JOB_COMPLETE',
+          'GET_STATE', 'LIST_BATCHES',
+        ]);
+        if (!allowed.has(mtype)) {
+          res.writeHead(400); res.end(`Unknown agent cmd: ${mtype}`); return;
+        }
+        const payload = { ...cmd, _agent: true, _ts: Date.now() };
+        broadcast(payload);
+        console.log(`[Agent Cmd] ${mtype} batchId=${cmd.batchId || '-'}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, recipients: wsClients.size }));
+      } catch (err) {
+        res.writeHead(400); res.end('Invalid JSON');
+      }
+    });
+    return;
+  } else if (reqUrl.startsWith('/agent/state') && req.method === 'POST') {
+    // Sidepanel posts its batch/job state here for the Agent to inspect.
+    // We just write to /tmp/opsv-reports/sidepanel-state.json (latest).
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body);
+        const dir = '/tmp/opsv-reports';
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const fname = `${dir}/sidepanel-state.json`;
+        fs.writeFileSync(fname, JSON.stringify(parsed.snapshot || parsed, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: fname }));
+      } catch (err) {
+        res.writeHead(400); res.end('Invalid JSON');
+      }
+    });
+    return;
   } else if (reqUrl.startsWith('/files')) {
     // Support both /files/<path> and /files?path=<encodedPath>
     const parsedUrl = new URL(reqUrl, 'http://127.0.0.1:9700');
@@ -131,10 +189,24 @@ wss.on('connection', (ws) => {
   wsClients.add(ws);
   console.log('WebSocket sidepanel client connected.');
 
+  // Replay last known queue so sidepanel refresh doesn't lose tasks
+  if (lastSyncPayload) {
+    ws.send(JSON.stringify(lastSyncPayload));
+    console.log('Replayed stored queue to new sidepanel client');
+  }
+
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString());
       handleWsMessage(ws, data);
+      // Log all messages to a separate file so the Agent can tail Agent-bound
+      // requests (BATCH_REQUEST_RUN / BATCH_READY / BATCH_DONE / BATCH_RETRY etc).
+      try {
+        const dir = '/tmp/opsv-reports';
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const line = `[${new Date().toISOString()}] ${data.type || '?'} ${JSON.stringify(data).slice(0, 500)}\n`;
+        fs.appendFileSync(`${dir}/agent-requests.log`, line);
+      } catch {}
     } catch (err) {
       console.error('Error handling WS message:', err);
     }
@@ -381,17 +453,24 @@ ipcServer.listen(ipcSocketPath, () => {
 });
 
 function sendToIpcClient(shotId, response) {
-  const socket = ipcClients.get(shotId);
-  if (socket) {
+  const entry = ipcClients.get(shotId);
+  if (entry) {
     try {
-      socket.write(JSON.stringify(response) + '\n');
+      entry.socket.write(JSON.stringify(response) + '\n');
     } catch (err) {
       console.error(`Error writing to IPC client for ${shotId}:`, err);
     } finally {
-      try { socket.end(); } catch {}
-      ipcClients.delete(shotId);
+      clearIpcClient(shotId);
     }
   }
+}
+
+function clearIpcClient(shotId) {
+  const entry = ipcClients.get(shotId);
+  if (!entry) return;
+  if (entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
+  try { entry.socket.end(); } catch {}
+  ipcClients.delete(shotId);
 }
 
 function handleIpcCommand(socket, cmd) {
@@ -414,7 +493,25 @@ function handleIpcCommand(socket, cmd) {
   } else if (ctype === 'generate') {
     const shotId = cmd.shotId;
     console.log(`[IPC Server]: Received generate task for: ${shotId}`);
-    ipcClients.set(shotId, socket);
+    // If there's already a waiter for this shotId, kill it (re-issue).
+    if (ipcClients.has(shotId)) {
+      console.log(`[IPC Server]: Replacing existing IPC waiter for ${shotId}`);
+      clearIpcClient(shotId);
+    }
+    const timeoutHandle = setTimeout(() => {
+      const entry = ipcClients.get(shotId);
+      if (!entry) return;
+      console.log(`[IPC Server]: Timeout for ${shotId} after ${IPC_TIMEOUT_MS}ms — sending failure and closing`);
+      try {
+        entry.socket.write(JSON.stringify({
+          type: 'task_result',
+          status: 'failed',
+          error: `IPC timeout after ${IPC_TIMEOUT_MS / 1000}s — likely tab refresh or content-script crash`,
+        }) + '\n');
+      } catch {}
+      clearIpcClient(shotId);
+    }, IPC_TIMEOUT_MS);
+    ipcClients.set(shotId, { socket, timeoutHandle });
 
     // ACK the client immediately
     socket.write(JSON.stringify({
@@ -447,7 +544,7 @@ function handleIpcCommand(socket, cmd) {
     socket.end();
 
     // Forward full batch to side panel (replaces old queue)
-    broadcast({
+    const syncMsg = {
       type: 'SYNC_QUEUE',
       jobs: jobs.map(j => ({
         id: j.id || j.shotId,
@@ -455,6 +552,8 @@ function handleIpcCommand(socket, cmd) {
         reference_files: j.refs || j.referenceFiles || [],
         watermark_removal: j.watermarkRemoval !== false
       }))
-    });
+    };
+    lastSyncPayload = syncMsg;
+    broadcast(syncMsg);
   }
 }

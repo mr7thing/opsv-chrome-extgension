@@ -154,13 +154,36 @@ function handleMsg(msg) {
       const incomingIds = new Set((msg.jobs || []).map(j => j.id).filter(Boolean));
       queuedJobs = queuedJobs.filter(j => !incomingIds.has(j.id)); // drop dupes
 
+      // If any job was running/in-flight when WS reconnected (e.g. user
+      // refreshed Gemini mid-task), it was wiped and can't recover. Mark it
+      // 'interrupted' so it's visibly broken instead of stuck on 'running'
+      // forever. User can retry by re-running the batch.
+      const interruptedIds = [];
+      for (const j of queuedJobs) {
+        if (j.status === 'running') {
+          j.status = 'interrupted';
+          j.interruptedReason = 'Refreshed during execution';
+          interruptedIds.push(j.id);
+        }
+      }
+      if (interruptedIds.length > 0) {
+        remoteLog(`Marked ${interruptedIds.length} job(s) as interrupted (likely refreshed mid-task): ${interruptedIds.join(', ')}`);
+      }
+      // Reset isRunning so runNextJob can fire on the new batch.
+      isRunning = false;
+      stopBtn.style.display = 'none';
+      runAllBtn.style.display = 'block';
+
       // Create a new batch
       const batchId = `b${Date.now().toString(36)}`;
       const batch = {
         id: batchId,
         color: nextBatchColor(),
         sentAt: new Date(),
-        jobIds: (msg.jobs || []).map(j => j.id).filter(Boolean)
+        jobIds: (msg.jobs || []).map(j => j.id).filter(Boolean),
+        status: 'queued',          // queued → gating → ready → running → done/failed/...
+        retryCount: 0,
+        convId: null,
       };
       batches.push(batch);
       activeBatchId = batchId;
@@ -176,7 +199,106 @@ function handleMsg(msg) {
       })));
       renderJobs();
       renderBatches();
-      if (isAutoMode && !isRunning) runNextJob();
+      // Agent-driven: do NOT auto-run. Ask Agent for permission.
+      requestAgentRun(batchId);
+      break;
+    case 'CONV_URL_CHANGED':
+      // Content script reports that Gemini URL changed to /app/<convId>.
+      // Tag the active batch so we can recover the conversation after refresh.
+      if (msg.convId && activeBatchId) {
+        const active = batches.find(b => b.id === activeBatchId);
+        if (active) {
+          active.convId = msg.convId;
+          active.convUrl = msg.url;
+          remoteLog(`Batch ${activeBatchId} tagged with convId=${msg.convId}`);
+          renderBatches();
+        }
+      }
+      break;
+    case 'GEMINI_TAB_READY':
+      // Content script confirms Gemini is on a fresh conversation page.
+      // Flip active batch from 'gating' → 'ready' and ping Agent to CONTINUE.
+      if (activeBatchId) {
+        const active = batches.find(b => b.id === activeBatchId);
+        if (active && active.status === 'gating') {
+          active.status = 'ready';
+          remoteLog(`Batch ${activeBatchId} now READY (Gemini on fresh chat)`);
+          renderBatches();
+          // Tell Agent the batch is ready to run.
+          requestAgentContinue(activeBatchId);
+        }
+      }
+      break;
+    case 'CONTINUE_BATCH':
+      // Agent says: run this batch now. Idempotent — only fires if status is 'ready' or 'queued'.
+      if (msg.batchId && activeBatchId === msg.batchId) {
+        const active = batches.find(b => b.id === msg.batchId);
+        if (!active) return;
+        if (active.status !== 'ready' && active.status !== 'queued') {
+          remoteLog(`CONTINUE_BATCH ignored — batch ${msg.batchId} status=${active.status}`);
+          return;
+        }
+        remoteLog(`Agent CONTINUE received for batch ${msg.batchId}`);
+        active.status = 'running';
+        runNextJob();
+      }
+      break;
+    case 'DENY_BATCH':
+      // Agent denied permission to run. Mark batch 'denied' with reason.
+      if (msg.batchId) {
+        const active = batches.find(b => b.id === msg.batchId);
+        if (active) {
+          active.status = 'denied';
+          active.denyReason = msg.reason || 'Denied by Agent';
+          remoteLog(`Batch ${msg.batchId} DENIED: ${active.denyReason}`);
+          renderBatches();
+        }
+      }
+      break;
+    case 'STOP_BATCH_ACK':
+      // Agent acknowledged STOP — actually halt execution.
+      stopRunAll();
+      break;
+    case 'GET_STATE':
+    case 'LIST_BATCHES':
+      // Dump current batch + job state to a sidepanel-state file so the Agent
+      // can see what's happening without owning a browser tab.
+      try {
+        const dir = '/tmp/opsv-reports';
+        // Can't mkdir in sandbox; use require if available.
+        if (typeof require !== 'undefined') {
+          // Sidepanel can't require, but try anyway.
+        }
+      } catch {}
+      // Use fetch to write through daemon.
+      const stateSnapshot = {
+        ts: Date.now(),
+        activeBatchId,
+        isRunning,
+        isAutoMode,
+        batches: batches.map(b => ({
+          id: b.id,
+          status: b.status,
+          retryCount: b.retryCount || 0,
+          convId: b.convId || null,
+          convUrl: b.convUrl || null,
+          jobIds: b.jobIds,
+          sentAt: b.sentAt,
+          completedAt: b.completedAt || null,
+        })),
+        jobs: queuedJobs.map(j => ({
+          id: j.id,
+          status: j.status,
+          batchId: j.batchId,
+          resultCount: (j.result_files || []).length,
+          interruptedReason: j.interruptedReason || null,
+        })),
+      };
+      fetch('http://127.0.0.1:9700/agent/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ snapshot: stateSnapshot }),
+      }).catch(() => {});
       break;
     case 'JOB_COMPLETE':
       // Daemon confirms a job is done — but we already track locally
@@ -671,7 +793,12 @@ async function runJobExecutor(job) {
 
 async function runNextJob() {
   if (isRunning) return;
-  const pending = queuedJobs.find(j => j.status === 'pending'); // frozen skipped
+  // Prefer jobs from the active batch (don't get stuck picking up dangling
+  // pending jobs from a previous aborted batch).
+  let pending = queuedJobs.find(j => j.batchId === activeBatchId && j.status === 'pending');
+  if (!pending) {
+    pending = queuedJobs.find(j => j.status === 'pending');
+  }
   if (!pending) {
     isRunning = false;
     // All jobs complete — show DONE badge + batch report
@@ -708,11 +835,21 @@ async function runNextJob() {
 
 function runAllJobs() {
   if (isRunning) return;
-  
-  // Reset failed jobs to pending
+
+  // Manual-mode Run button: user wants this batch to fire.
+  // In Agent-driven mode, we ask the Agent first (it can DENY/CONTINUE).
+  // Reset failed jobs to pending so the run can pick them up.
   for (const job of queuedJobs) {
-    if (job.status === 'failed') {
+    if (job.status === 'failed' || job.status === 'interrupted') {
       job.status = 'pending';
+    }
+  }
+
+  if (activeBatchId) {
+    const active = batches.find(b => b.id === activeBatchId);
+    if (active) {
+      active.retryCount = 0; // user explicit click resets retry budget
+      active.status = 'queued';
     }
   }
 
@@ -721,15 +858,17 @@ function runAllJobs() {
   modeManualBtn.classList.remove('active');
   modeLabel.textContent = 'AUTO';
   renderJobs();
+  renderBatches();
 
-  runNextJob();
+  // Don't runNextJob directly — ask Agent first.
+  if (activeBatchId) requestAgentRun(activeBatchId);
 }
 
 function onJobComplete(shotId, result) {
+  const job = queuedJobs.find(j => j.id === shotId);
   if (result.success) {
     updateJobStatus(shotId, 'done');
 
-    const job = queuedJobs.find(j => j.id === shotId);
     if (job) {
       job.result_files = result.paths || [];
     }
@@ -755,14 +894,36 @@ function onJobComplete(shotId, result) {
   stopBtn.style.display = 'none';
   runAllBtn.style.display = 'block';
 
-  // Auto-advance if in auto mode
-  if (isAutoMode) {
+  // Check if the active batch is fully done.
+  if (activeBatchId) {
+    const batch = batches.find(b => b.id === activeBatchId);
+    const bj = queuedJobs.filter(j => j.batchId === activeBatchId);
+    const allDone = bj.length > 0 && bj.every(j => j.status === 'done' || j.status === 'failed');
+    if (allDone && batch) {
+      // Mark batch terminal state.
+      const doneCount = bj.filter(j => j.status === 'done').length;
+      const failedCount = bj.length - doneCount;
+      batch.status = failedCount === 0 ? 'done' : 'partial';
+      batch.completedAt = new Date();
+      remoteLog(`Batch ${activeBatchId} finished: ${doneCount} done, ${failedCount} failed`);
+      renderBatches();
+      // Tell Agent the batch is done — Agent decides whether to start next batch.
+      reportBatchDone(activeBatchId, {
+        done: bj.filter(j => j.status === 'done').map(j => j.id),
+        failed: bj.filter(j => j.status === 'failed').map(j => ({ id: j.id, error: j._lastError })),
+        convId: batch.convId || null,
+      });
+    } else if (isAutoMode) {
+      // More jobs in this batch — keep going without Agent re-prompt.
+      setTimeout(runNextJob, 3000 + Math.random() * 3000);
+    }
+  } else if (isAutoMode) {
+    // No active batch (shouldn't really happen) — auto-advance.
     setTimeout(runNextJob, 3000 + Math.random() * 3000);
   }
-
 }
 
-// ── Chrome runtime messages (from content script)
+// ── Chrome runtime messages (from content script / background)
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'ASSET_SAVED') {
@@ -779,6 +940,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   } else if (request.type === 'REMOTE_LOG') {
     // Forward logs to daemon
     sendWs({ type: 'LOG', message: request.message });
+  } else if (request.type === 'CONV_URL_CHANGED') {
+    // Background-broadcast from content script: Gemini URL gained a convId.
+    if (activeBatchId && request.convId) {
+      const active = batches.find(b => b.id === activeBatchId);
+      if (active) {
+        active.convId = request.convId;
+        active.convUrl = request.url;
+        remoteLog(`Batch ${activeBatchId} tagged with convId=${request.convId} (source=${request.source})`);
+        renderBatches();
+      }
+    }
+  } else if (request.type === 'GEMINI_TAB_READY') {
+    // Content script confirms Gemini is on a fresh /app page (composer empty).
+    // If the active batch is in 'gating' (waiting for fresh chat), advance to 'ready'.
+    if (activeBatchId) {
+      const active = batches.find(b => b.id === activeBatchId);
+      if (active && active.status === 'gating') {
+        active.status = 'ready';
+        remoteLog(`Batch ${activeBatchId} now READY (Gemini on fresh chat)`);
+        renderBatches();
+        requestAgentContinue(activeBatchId);
+      } else if (active) {
+        // Even if not gating (e.g. we already moved past), record conv state.
+        if (request.convId && !active.convId) {
+          active.convId = request.convId;
+          active.convUrl = request.url;
+          renderBatches();
+        }
+      }
+    }
   }
 });
 
@@ -1114,6 +1305,182 @@ function initFiltersAndSelection() {
 
 // ── Manual Injections ──────────────────────────────────────────────────────────
 
+// ── Tab Refresh Watcher ────────────────────────────────────────────────────────
+// Detect when the user refreshes the Gemini tab mid-task. The content script
+// dies and any in-flight upload/typing is lost.
+//
+// Recovery semantics:
+//   - If we had a convId for the active batch, the conversation is still on
+//     Gemini's server. Mark the batch 'partial' (not failed) so the Agent can
+//     decide whether to inspect / re-run. B1: auto-retry up to 3 times. Then
+//     B2: leave it for manual decision.
+//   - If we had NO convId, the prompt never reached Gemini. Mark the batch
+//     'failed' and (if retries remain) retry; otherwise escalate.
+const _geminiTabStates = new Map(); // tabId -> last known 'complete'/'loading'
+const BATCH_AUTO_RETRY_MAX = 3;
+
+if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    try {
+      if (!tab?.url?.includes('gemini.google.com')) return;
+      const prev = _geminiTabStates.get(tabId);
+      if (changeInfo.status === 'loading' && prev === 'complete') {
+        // Gemini tab was complete and is now loading → user refreshed / navigated.
+        handleGeminiRefreshed();
+      }
+      if (changeInfo.status) _geminiTabStates.set(tabId, changeInfo.status);
+    } catch (err) {
+      remoteLog('Tab refresh watcher error:', err.message);
+    }
+  });
+
+  // Clean up map when tabs close.
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    _geminiTabStates.delete(tabId);
+  });
+}
+
+function handleGeminiRefreshed() {
+  if (!activeBatchId) return;
+  const active = batches.find(b => b.id === activeBatchId);
+  if (!active) return;
+  // Only react if we were actively running or ready to run.
+  if (!['running', 'gating', 'ready', 'queued'].includes(active.status)) return;
+
+  const hadConvId = !!active.convId;
+  let interruptedCount = 0;
+  for (const j of queuedJobs) {
+    if (j.status === 'running') {
+      j.status = 'interrupted';
+      j.interruptedReason = hadConvId ? 'Gemini refreshed; partial result recoverable via convId' : 'Gemini refreshed before prompt sent';
+      interruptedCount++;
+      sendWs({ type: 'JOB_FAILED', shotId: j.id, error: j.interruptedReason });
+    }
+  }
+
+  if (hadConvId) {
+    // B1 path: auto-retry up to N times. Each retry should re-use the convId
+    // so we can inspect last result before re-running.
+    active.status = 'partial';
+    active.partialReason = `Refreshed during run; convId=${active.convId}`;
+    active.retryCount = (active.retryCount || 0) + 1;
+    remoteLog(`Batch ${activeBatchId} PARTIAL (refresh during run, convId=${active.convId}, retry ${active.retryCount}/${BATCH_AUTO_RETRY_MAX})`);
+
+    if (active.retryCount <= BATCH_AUTO_RETRY_MAX) {
+      // B1: auto-retry. Reset job statuses to pending and request Agent continue.
+      for (const j of queuedJobs) {
+        if (j.status === 'interrupted') j.status = 'pending';
+      }
+      isRunning = false;
+      currentJob = null;
+      stopBtn.style.display = 'none';
+      runAllBtn.style.display = 'block';
+      active.status = 'gating'; // wait for fresh /app page
+      renderJobs();
+      renderBatches();
+      requestAgentRetry(activeBatchId, active.retryCount);
+    } else {
+      // B2: escalate to manual decision.
+      remoteLog(`Batch ${activeBatchId} ESCALATED after ${BATCH_AUTO_RETRY_MAX} retries; awaiting Agent decision`);
+      sendWs({
+        type: 'BATCH_ESCALATE',
+        batchId: activeBatchId,
+        reason: `Auto-retried ${BATCH_AUTO_RETRY_MAX} times; user decision required`,
+        convId: active.convId,
+        convUrl: active.convUrl,
+      });
+      renderBatches();
+    }
+  } else {
+    // No convId captured → prompt never sent → safe to retry immediately.
+    active.status = 'failed';
+    active.failReason = 'Refreshed before prompt reached Gemini';
+    active.retryCount = (active.retryCount || 0) + 1;
+    remoteLog(`Batch ${activeBatchId} FAILED (refresh before prompt, no convId), retry ${active.retryCount}/${BATCH_AUTO_RETRY_MAX}`);
+    if (active.retryCount <= BATCH_AUTO_RETRY_MAX) {
+      // B1: auto-retry immediately — no conv to inspect.
+      for (const j of queuedJobs) {
+        if (j.status === 'interrupted') j.status = 'pending';
+      }
+      isRunning = false;
+      currentJob = null;
+      stopBtn.style.display = 'none';
+      runAllBtn.style.display = 'block';
+      active.status = 'gating';
+      renderJobs();
+      renderBatches();
+      requestAgentRetry(activeBatchId, active.retryCount);
+    } else {
+      active.status = 'escalated';
+      sendWs({
+        type: 'BATCH_ESCALATE',
+        batchId: activeBatchId,
+        reason: `Auto-retried ${BATCH_AUTO_RETRY_MAX} times with no convId; user decision required`,
+        convId: null,
+      });
+      renderBatches();
+    }
+  }
+}
+
+// ── Agent ↔ Sidepanel Protocol ───────────────────────────────────────────────
+// Sidepanel is now a TOOL CALL target for the Agent (opsv host / user). It
+// requests permission to run batches and reports state changes back.
+function requestAgentRun(batchId) {
+  const batch = batches.find(b => b.id === batchId);
+  if (!batch) return;
+  const jobList = queuedJobs.filter(j => j.batchId === batchId).map(j => ({
+    id: j.id,
+    promptPreview: (j.prompt || '').slice(0, 120),
+    referenceCount: (j.reference_files || []).length,
+  }));
+  sendWs({
+    type: 'BATCH_REQUEST_RUN',
+    batchId,
+    jobs: jobList,
+  });
+  remoteLog(`Sent BATCH_REQUEST_RUN to Agent for ${batchId}`);
+}
+
+function requestAgentContinue(batchId) {
+  const batch = batches.find(b => b.id === batchId);
+  sendWs({
+    type: 'BATCH_READY',
+    batchId,
+    status: batch?.status,
+    convId: batch?.convId || null,
+  });
+  remoteLog(`Sent BATCH_READY to Agent for ${batchId}`);
+}
+
+function requestAgentRetry(batchId, attempt) {
+  sendWs({
+    type: 'BATCH_RETRY',
+    batchId,
+    attempt,
+    maxAttempts: BATCH_AUTO_RETRY_MAX,
+  });
+  remoteLog(`Sent BATCH_RETRY to Agent for ${batchId} (attempt ${attempt})`);
+}
+
+function requestAgentStop(batchId) {
+  sendWs({
+    type: 'BATCH_STOP_REQUEST',
+    batchId,
+  });
+  remoteLog(`Sent BATCH_STOP_REQUEST to Agent for ${batchId}`);
+}
+
+// Report batch completion to Agent (so Agent can decide on next batch).
+function reportBatchDone(batchId, summary) {
+  sendWs({
+    type: 'BATCH_DONE',
+    batchId,
+    ...summary,
+  });
+  remoteLog(`Sent BATCH_DONE to Agent for ${batchId}`);
+}
+
 async function getOrOpenGeminiTab() {
   const tabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
   let tab;
@@ -1224,6 +1591,9 @@ async function checkRecovery() {
 // ── Stop Button ────────────────────────────────────────────────────────────
 
 function stopRunAll() {
+  // In Agent-driven mode, ask Agent to stop (it ACKs with STOP_BATCH_ACK).
+  // If no Agent connection / we just want to halt immediately, we still
+  // do the local teardown.
   isAutoMode = false;
   isRunning = false;
   currentJob = null;
@@ -1233,6 +1603,30 @@ function stopRunAll() {
   stopBtn.style.display = 'none';
   runAllBtn.style.display = 'block';
   renderJobs();
+
+  // Tell the content script too (in case it's mid-prompt).
+  getOrOpenGeminiTab().then((tabId) => {
+    chrome.tabs.sendMessage(tabId, { type: 'STOP_JOB' }).catch(() => {});
+  }).catch(() => {});
+
+  // Ask Agent to ack the stop so we don't auto-retry on next event.
+  if (activeBatchId) {
+    const active = batches.find(b => b.id === activeBatchId);
+    if (active && !['done', 'failed', 'escalated', 'denied', 'stopped'].includes(active.status)) {
+      active.status = 'stopped';
+      renderBatches();
+    }
+    requestAgentStop(activeBatchId);
+  }
+
+  // Also send JOB_FAILED for any currently-running job so daemon IPC unblocks.
+  for (const j of queuedJobs) {
+    if (j.status === 'running') {
+      j.status = 'failed';
+      j.interruptedReason = 'Stopped by user';
+      sendWs({ type: 'JOB_FAILED', shotId: j.id, error: 'Stopped by user' });
+    }
+  }
 
   if (chrome.action) {
     chrome.action.setBadgeText({ text: 'OFF' });
